@@ -157,12 +157,6 @@ cargo doc --no-deps
 - [JavaScript / TypeScript SDK](https://www.npmjs.com/package/@hot-dev/sdk)
 - [Python SDK](https://pypi.org/project/hot-dev/)
 
-## Layer 2 Helpers
-
-This SDK intentionally covers the core Hot API (Layer 1). Agent, webhook, and
-proxy helpers (Layer 2) currently live in the JavaScript SDK's subpath exports
-(`@hot-dev/sdk/agent`, `/webhook`, `/proxy`).
-
 ## License
 
 Apache-2.0
