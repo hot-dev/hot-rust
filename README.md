@@ -5,7 +5,7 @@ Official Rust SDK for the [Hot Dev](https://hot.dev) API.
 - crates.io: `hot-dev`
 - Import: `hot_dev`
 - Async (tokio); TLS via rustls
-- MSRV: 1.82
+- MSRV: 1.86
 
 ## Install
 

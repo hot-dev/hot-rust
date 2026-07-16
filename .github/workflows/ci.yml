@@ -11,18 +11,15 @@ permissions:
 
 jobs:
   test:
-    name: Test (${{ matrix.toolchain }})
+    name: Test (stable)
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        toolchain: [stable, "1.82"]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust
-        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rustfmt,clippy && rustup default ${{ matrix.toolchain }}
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -31,21 +28,48 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ matrix.toolchain }}-${{ hashFiles('Cargo.toml') }}
+          key: cargo-stable-${{ hashFiles('Cargo.lock') }}
 
       - name: Check formatting
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
       - name: Docs
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # The MSRV promise applies to consumers of the library, so this leg builds
+  # only the library and its dependency tree (`cargo check` skips
+  # dev-dependencies, which may require newer toolchains). --locked keeps the
+  # resolved tree from drifting past what the pinned toolchain can parse.
+  msrv:
+    name: MSRV (1.86)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install 1.86 --profile minimal && rustup default 1.86
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-msrv-${{ hashFiles('Cargo.lock') }}
+
+      - name: Check (library only)
+        run: cargo check --locked
 
   integration:
     name: Integration (hot dev)

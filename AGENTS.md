@@ -10,7 +10,7 @@ This repo contains the Rust SDK for the Hot Dev API.
   structs); responses are `serde_json::Map` (`JsonObject`) in the Hot API wire
   format (`event_type`, `stream_id`). The SDK never transforms user-owned
   payloads such as `event_data`. SDK-only options use Rust-style names.
-- MSRV 1.82 (declared in Cargo.toml `rust-version`)
+- MSRV 1.86 (declared in Cargo.toml `rust-version`; CI checks the library only — dev-dependencies may need newer toolchains)
 - Versioning follows the public API package version, in lockstep with
   `@hot-dev/sdk` (npm) and `hot-dev` (PyPI).
 
