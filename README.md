@@ -153,6 +153,7 @@ cargo doc --no-deps
 ## Related
 
 - [Hot Dev documentation](https://hot.dev/docs)
+- [SDK docs](https://hot.dev/docs/api/sdks)
 - [JavaScript / TypeScript SDK](https://www.npmjs.com/package/@hot-dev/sdk)
 - [Python SDK](https://pypi.org/project/hot-dev/)
 
