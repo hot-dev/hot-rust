@@ -236,15 +236,9 @@ async fn api_error_falls_back_to_retry_after_header() {
 async fn call_hot_uses_nested_run_failure_result() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1/events"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({
-            "event_id": "evt_123", "stream_id": "str_123",
-        }))))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1/streams/str_123/subscribe"))
+        .and(path("/v1/streams/subscribe-with-event"))
         .respond_with(sse_response(&[
+            r#"{"type":"event:published","event_id":"evt_123","stream_id":"str_123"}"#,
             r#"{"type":"run:start","run":{"run_id":"run_123","event_id":"evt_123"}}"#,
             r#"{"type":"run:fail","run":{"run_id":"run_123","event_id":"evt_123","status":"failed","result":{"$err":{"message":"boom"}}}}"#,
         ]))
@@ -270,15 +264,9 @@ async fn call_hot_uses_nested_run_failure_result() {
 async fn call_hot_surfaces_hot_run_failure_shape() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1/events"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({
-            "event_id": "evt_123", "stream_id": "str_123",
-        }))))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1/streams/str_123/subscribe"))
+        .and(path("/v1/streams/subscribe-with-event"))
         .respond_with(sse_response(&[
+            r#"{"type":"event:published","event_id":"evt_123","stream_id":"str_123"}"#,
             r#"{"type":"run:start","run":{"run_id":"run_123","event_id":"evt_123"}}"#,
             r#"{"type":"run:fail","run":{"run_id":"run_123","event_id":"evt_123","status":"failed","result":{"$type":"::hot::run/Failure","$origin":{"function":"::hot::exec/fail"},"$val":{"msg":"too hot","err":"too hot"}}}}"#,
         ]))
@@ -304,19 +292,13 @@ async fn call_hot_surfaces_hot_run_failure_shape() {
 async fn call_hot_unwraps_ok_result_and_streams_chunks() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1/events"))
+        .and(path("/v1/streams/subscribe-with-event"))
         .and(body_json(json!({
             "event_type": "hot:call",
             "event_data": { "fn": "demo/fn", "args": [1, 2] },
         })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({
-            "event_id": "evt_1", "stream_id": "str_1",
-        }))))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1/streams/str_1/subscribe"))
         .respond_with(sse_response(&[
+            r#"{"type":"event:published","event_id":"evt_1","stream_id":"str_1"}"#,
             r#"{"type":"run:start","run":{"run_id":"r1","event_id":"evt_1"}}"#,
             r#"{"type":"stream:data","run_id":"r1","payload":{"text":"partial"}}"#,
             r#"{"type":"run:stop","run":{"run_id":"r1","event_id":"evt_1","result":{"$ok":42}}}"#,

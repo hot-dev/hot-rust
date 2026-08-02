@@ -47,7 +47,7 @@ async fn subscribe_with_event_reconnects_via_stream_id() {
         .and(path("/v1/streams/subscribe-with-event"))
         .respond_with(sse_response(&[
             PUBLISHED,
-            r#"{"type":"run:start","run":{"run_id":"r1"}}"#,
+            r#"{"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}"#,
         ]))
         .expect(1)
         .mount(&server)
@@ -55,8 +55,8 @@ async fn subscribe_with_event_reconnects_via_stream_id() {
     Mock::given(method("GET"))
         .and(path("/v1/streams/s1/subscribe"))
         .respond_with(sse_response(&[
-            r#"{"type":"run:start","run":{"run_id":"r1"}}"#,
-            r#"{"type":"run:stop","run":{"run_id":"r1","result":"done"}}"#,
+            r#"{"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}"#,
+            r#"{"type":"run:stop","run":{"run_id":"r1","event_id":"e1","result":"done"}}"#,
         ]))
         .expect(1)
         .mount(&server)
@@ -79,7 +79,7 @@ async fn subscribe_with_event_no_reconnect_returns_after_first_connection() {
         .and(path("/v1/streams/subscribe-with-event"))
         .respond_with(sse_response(&[
             PUBLISHED,
-            r#"{"type":"run:start","run":{"run_id":"r1"}}"#,
+            r#"{"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}"#,
         ]))
         .expect(1)
         .mount(&server)
@@ -101,17 +101,18 @@ async fn subscribe_with_event_dedupes_run_events_by_run_id() {
         .and(path("/v1/streams/subscribe-with-event"))
         .respond_with(sse_response(&[
             PUBLISHED,
-            r#"{"type":"run:start","run":{"run_id":"r1"}}"#,
+            r#"{"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}"#,
         ]))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/v1/streams/s1/subscribe"))
         .respond_with(sse_response(&[
-            r#"{"type":"run:start","run":{"run_id":"r1"}}"#,
-            r#"{"type":"run:start","run":{"run_id":"r2"}}"#,
-            r#"{"type":"run:fail","run":{"run_id":"r1","result":"err"}}"#,
-            r#"{"type":"run:fail","run":{"run_id":"r1","result":"err"}}"#,
+            r#"{"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}"#,
+            r#"{"type":"run:start","run":{"run_id":"r2","event_id":"e2"}}"#,
+            r#"{"type":"run:fail","run":{"run_id":"r2","event_id":"e2","result":"other"}}"#,
+            r#"{"type":"run:fail","run":{"run_id":"r1","event_id":"e1","result":"err"}}"#,
+            r#"{"type":"run:fail","run":{"run_id":"r1","event_id":"e1","result":"err"}}"#,
         ]))
         .mount(&server)
         .await;
@@ -132,7 +133,7 @@ async fn subscribe_with_event_dedupes_run_events_by_run_id() {
         .collect();
 
     assert_eq!(start_ids, vec!["r1", "r2"]);
-    assert_eq!(fail_ids, vec!["r1"]);
+    assert_eq!(fail_ids, vec!["r2", "r1"]);
 }
 
 #[tokio::test]

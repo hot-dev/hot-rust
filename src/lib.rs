@@ -49,8 +49,9 @@ pub use client::{HotClient, HotClientBuilder};
 pub use error::{ApiError, Error};
 pub use resources::{
     BuildUpload, BuildsResource, CallOptions, ContextResource, DomainsResource, EnvResource,
-    EventsResource, FilesResource, OrgResource, ProjectsResource, RunsResource,
-    ServiceKeysResource, SessionsResource, StreamsResource, SubscribeWithEventOptions, WaitOptions,
+    EventsResource, FilesResource, OrgResource, ProjectsResource, RunWaitOptions, RunsResource,
+    ServiceKeysResource, SessionsResource, StreamsResource, SubscribeWithEventOptions,
+    TaskWaitOptions, TasksResource, WaitOptions,
 };
 pub use streaming::{EventStream, StreamEventExt};
 

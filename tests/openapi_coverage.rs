@@ -93,6 +93,9 @@ fn coverage() -> BTreeMap<&'static str, &'static str> {
         ("GET /v1/runs", "runs.list"),
         ("GET /v1/runs/stats", "runs.stats"),
         ("GET /v1/runs/{run_id}", "runs.get"),
+        ("GET /v1/runs/{run_id}/subscribe", "runs.subscribe"),
+        ("GET /v1/tasks/{task_id}", "tasks.get"),
+        ("GET /v1/tasks/{task_id}/subscribe", "tasks.subscribe"),
         ("POST /v1/events", "events.publish"),
         ("GET /v1/events", "events.list"),
         ("GET /v1/events/{event_id}", "events.get"),
@@ -152,7 +155,9 @@ fn coverage() -> BTreeMap<&'static str, &'static str> {
 /// removed or renamed SDK method breaks this function's body.
 #[allow(dead_code, clippy::diverging_sub_expression)]
 async fn method_exists(client: hot_dev::HotClient) -> hot_dev::Result<()> {
-    use hot_dev::{BuildUpload, CallOptions, SubscribeWithEventOptions, WaitOptions};
+    use hot_dev::{
+        BuildUpload, CallOptions, SubscribeWithEventOptions, TaskWaitOptions, WaitOptions,
+    };
     let body = serde_json::Map::new();
     let q: &[(&str, &str)] = &[];
 
@@ -226,6 +231,12 @@ async fn method_exists(client: hot_dev::HotClient) -> hot_dev::Result<()> {
     let _ = client.env().subscribe();
     let _ = client.org().usage().await?;
 
+    let _ = client.runs().subscribe("r");
+    let _ = client
+        .runs()
+        .wait("r", hot_dev::RunWaitOptions::default())
+        .await?;
+
     let _ = client.streams().subscribe("s", None);
     let _ = client.streams().subscribe_post("s", None);
     let _ = client
@@ -235,6 +246,9 @@ async fn method_exists(client: hot_dev::HotClient) -> hot_dev::Result<()> {
         .streams()
         .wait_for_run_result("s", "e", WaitOptions::default())
         .await?;
+    let _ = client.tasks().get("t").await?;
+    let _ = client.tasks().subscribe("t");
+    let _ = client.tasks().wait("t", TaskWaitOptions::default()).await?;
 
     let _ = client.files().list(q).await?;
     let _ = client.files().get("f").await?;

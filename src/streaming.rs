@@ -120,65 +120,267 @@ pub(crate) async fn wait_for_run_result(
 ) -> crate::Result<JsonObject> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut current_run_id: Option<String> = None;
-    let mut source = iter_stream(
-        transport,
-        Method::GET,
-        format!("/streams/{}/subscribe", enc(stream_id)),
-        None,
-        Vec::new(),
-    );
-
-    loop {
-        let item = match tokio::time::timeout_at(deadline, source.next()).await {
-            Ok(item) => item,
-            Err(_) => return Err(Error::Timeout),
-        };
-        let Some(item) = item else { break };
-        let event = item?;
-
-        match event.event_type() {
-            "run:start" => {
-                if event_id_of_run(event.run()) == Some(event_id) {
-                    current_run_id = event.run_id().map(str::to_string);
-                }
-            }
-            "stream:data" => {
-                let matches_run = current_run_id.as_deref().is_some_and(|current| {
-                    event.get("run_id").and_then(Value::as_str) == Some(current)
-                });
-                if matches_run {
-                    if let Some(on_chunk) = on_chunk.as_deref_mut() {
-                        if let Some(text) = event
-                            .get("payload")
-                            .and_then(Value::as_object)
-                            .and_then(|payload| payload.get("text"))
-                            .and_then(Value::as_str)
-                        {
-                            on_chunk(text);
-                        }
+    for attempts in 0..=5 {
+        let mut source = iter_stream(
+            transport.clone(),
+            Method::GET,
+            format!("/streams/{}/subscribe", enc(stream_id)),
+            None,
+            Vec::new(),
+        );
+        loop {
+            let item = match tokio::time::timeout_at(deadline, source.next()).await {
+                Ok(item) => item,
+                Err(_) => return Err(Error::Timeout),
+            };
+            let Some(item) = item else { break };
+            match item {
+                Ok(event) => {
+                    if let Some(run) =
+                        handle_run_event(&event, event_id, &mut current_run_id, &mut on_chunk)?
+                    {
+                        return Ok(run);
                     }
                 }
+                Err(_error) if attempts < 5 => break,
+                Err(error) => return Err(error),
             }
-            event_type @ ("run:stop" | "run:fail" | "run:cancel") => {
-                let Some(run) = event.run() else { continue };
-                if event_id_of_run(Some(run)) != Some(event_id) {
-                    continue;
-                }
-                match event_type {
-                    "run:fail" => {
-                        return Err(Error::RunFailed(run_result_message(run, "run failed")))
-                    }
-                    "run:cancel" => {
-                        return Err(Error::RunFailed(run_result_message(run, "run cancelled")))
-                    }
-                    _ => return Ok(run.clone()),
-                }
-            }
-            _ => {}
+        }
+        if attempts == 5 {
+            return Err(Error::Protocol("stream ended before run completed".into()));
         }
     }
+    unreachable!()
+}
 
-    Err(Error::Protocol("stream ended before run completed".into()))
+pub(crate) async fn wait_for_call_result(
+    transport: Arc<Transport>,
+    body: JsonObject,
+    timeout: Duration,
+    mut on_chunk: Option<&mut (dyn FnMut(&str) + Send)>,
+) -> crate::Result<JsonObject> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut stream_id: Option<String> = None;
+    let mut event_id: Option<String> = None;
+    let mut current_run_id: Option<String> = None;
+
+    for attempts in 0..=5 {
+        let (method, path, request_body) = match stream_id.as_deref() {
+            None => (
+                Method::POST,
+                "/streams/subscribe-with-event".to_string(),
+                Some(Value::Object(body.clone())),
+            ),
+            Some(stream_id) => (
+                Method::GET,
+                format!("/streams/{}/subscribe", enc(stream_id)),
+                None,
+            ),
+        };
+        let mut source = iter_stream(transport.clone(), method, path, request_body, Vec::new());
+        loop {
+            let item = match tokio::time::timeout_at(deadline, source.next()).await {
+                Ok(item) => item,
+                Err(_) => return Err(Error::Timeout),
+            };
+            let Some(item) = item else { break };
+            let event = match item {
+                Ok(event) => event,
+                Err(_error) if stream_id.is_some() && attempts < 5 => break,
+                Err(error) => return Err(error),
+            };
+            if event.event_type() == "event:published" {
+                stream_id = event
+                    .get("stream_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                event_id = event
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            if let Some(event_id) = event_id.as_deref() {
+                if let Some(run) =
+                    handle_run_event(&event, event_id, &mut current_run_id, &mut on_chunk)?
+                {
+                    return Ok(run);
+                }
+            }
+        }
+        if stream_id.is_none() || event_id.is_none() {
+            return Err(Error::Protocol(
+                "stream ended before event:published was received".into(),
+            ));
+        }
+        if attempts == 5 {
+            return Err(Error::Protocol("stream ended before run completed".into()));
+        }
+    }
+    unreachable!()
+}
+
+pub(crate) async fn wait_for_task(
+    transport: Arc<Transport>,
+    task_id: &str,
+    timeout: Duration,
+    max_attempts: u32,
+) -> crate::Result<JsonObject> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    for attempts in 0..=max_attempts {
+        let mut source = iter_stream(
+            transport.clone(),
+            Method::GET,
+            format!("/tasks/{}/subscribe", enc(task_id)),
+            None,
+            Vec::new(),
+        );
+        loop {
+            let item = match tokio::time::timeout_at(deadline, source.next()).await {
+                Ok(item) => item,
+                Err(_) => return Err(Error::TaskTimeout),
+            };
+            let Some(item) = item else { break };
+            let event = match item {
+                Ok(event) => event,
+                Err(_error) if attempts < max_attempts => break,
+                Err(error) => return Err(error),
+            };
+            if event.event_type() != "task:update" {
+                continue;
+            }
+            let Some(task) = event.get("task").and_then(Value::as_object) else {
+                continue;
+            };
+            match task.get("status").and_then(Value::as_str) {
+                Some("completed") => return Ok(task.clone()),
+                Some("failed" | "cancelled" | "timed_out") => {
+                    let status = task
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed");
+                    let message = result_message(task.get("result"))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("task {status}"));
+                    return Err(Error::TaskFailed {
+                        message,
+                        task: task.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        if attempts == max_attempts {
+            return Err(Error::Protocol(
+                "task subscription ended before the task completed".into(),
+            ));
+        }
+    }
+    unreachable!()
+}
+
+pub(crate) async fn wait_for_run(
+    transport: Arc<Transport>,
+    run_id: &str,
+    timeout: Duration,
+    max_attempts: u32,
+) -> crate::Result<JsonObject> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    for attempts in 0..=max_attempts {
+        let mut source = iter_stream(
+            transport.clone(),
+            Method::GET,
+            format!("/runs/{}/subscribe", enc(run_id)),
+            None,
+            Vec::new(),
+        );
+        loop {
+            let item = match tokio::time::timeout_at(deadline, source.next()).await {
+                Ok(item) => item,
+                Err(_) => return Err(Error::Timeout),
+            };
+            let Some(item) = item else { break };
+            let event = match item {
+                Ok(event) => event,
+                Err(_error) if attempts < max_attempts => break,
+                Err(error) => return Err(error),
+            };
+            if event.event_type() != "run:update" {
+                continue;
+            }
+            let Some(run) = event.get("run").and_then(Value::as_object) else {
+                continue;
+            };
+            match run.get("status").and_then(Value::as_str) {
+                Some("succeeded") => return Ok(run.clone()),
+                Some(status @ ("failed" | "cancelled")) => {
+                    let message = run_result_message(run, &format!("run {status}"));
+                    return Err(Error::RunWaitFailed {
+                        message,
+                        run: run.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        if attempts == max_attempts {
+            return Err(Error::Protocol(
+                "run subscription ended before the run completed".into(),
+            ));
+        }
+    }
+    unreachable!()
+}
+
+// Keep the public Error::Api(ApiError) shape stable for the 1.x SDK. Boxing
+// that variant only to shrink this internal Result would be a breaking change.
+#[allow(clippy::result_large_err)]
+fn handle_run_event(
+    event: &StreamEvent,
+    event_id: &str,
+    current_run_id: &mut Option<String>,
+    on_chunk: &mut Option<&mut (dyn FnMut(&str) + Send)>,
+) -> crate::Result<Option<JsonObject>> {
+    match event.event_type() {
+        "run:start" => {
+            if event_id_of_run(event.run()) == Some(event_id) {
+                *current_run_id = event.run_id().map(str::to_string);
+            }
+        }
+        "stream:data" => {
+            let matches_run = current_run_id.as_deref().is_some_and(|current| {
+                event.get("run_id").and_then(Value::as_str) == Some(current)
+            });
+            if matches_run {
+                if let Some(on_chunk) = on_chunk.as_deref_mut() {
+                    if let Some(text) = event
+                        .get("payload")
+                        .and_then(Value::as_object)
+                        .and_then(|payload| payload.get("text"))
+                        .and_then(Value::as_str)
+                    {
+                        on_chunk(text);
+                    }
+                }
+            }
+        }
+        event_type @ ("run:stop" | "run:fail" | "run:cancel") => {
+            let Some(run) = event.run() else {
+                return Ok(None);
+            };
+            if event_id_of_run(Some(run)) != Some(event_id) {
+                return Ok(None);
+            }
+            match event_type {
+                "run:fail" => return Err(Error::RunFailed(run_result_message(run, "run failed"))),
+                "run:cancel" => {
+                    return Err(Error::RunFailed(run_result_message(run, "run cancelled")))
+                }
+                _ => return Ok(Some(run.clone())),
+            }
+        }
+        _ => {}
+    }
+    Ok(None)
 }
 
 pub(crate) fn event_id_of_run(run: Option<&JsonObject>) -> Option<&str> {

@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::resources::{
     BuildsResource, ContextResource, DomainsResource, EnvResource, EventsResource, FilesResource,
     OrgResource, ProjectsResource, RunsResource, ServiceKeysResource, SessionsResource,
-    StreamsResource,
+    StreamsResource, TasksResource,
 };
 use crate::transport::{Transport, DEFAULT_BASE_URL};
 use crate::{JsonObject, Result};
@@ -95,6 +95,10 @@ impl HotClient {
 
     pub fn streams(&self) -> StreamsResource {
         StreamsResource::new(self.transport.clone())
+    }
+
+    pub fn tasks(&self) -> TasksResource {
+        TasksResource::new(self.transport.clone())
     }
 
     /// Calls a JSON API endpoint that does not yet have a resource helper.

@@ -21,9 +21,18 @@ pub enum Error {
     /// message.
     #[error("{0}")]
     RunFailed(String),
+    /// A waited run reached a failed or cancelled terminal state.
+    #[error("{message}")]
+    RunWaitFailed { message: String, run: JsonObject },
+    /// A task reached a failed, cancelled, or timed-out terminal state.
+    #[error("{message}")]
+    TaskFailed { message: String, task: JsonObject },
     /// Timed out waiting for a run result.
     #[error("timeout waiting for run result")]
     Timeout,
+    /// Timed out waiting for a task result.
+    #[error("timeout waiting for task")]
+    TaskTimeout,
     /// The stream ended before the expected event arrived.
     #[error("{0}")]
     Protocol(String),

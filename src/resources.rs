@@ -13,7 +13,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::streaming::{
-    extract_run_result, iter_stream, wait_for_run_result, EventStream, StreamEventExt,
+    extract_run_result, iter_stream, wait_for_call_result, wait_for_run, wait_for_run_result,
+    wait_for_task, EventStream, StreamEventExt,
 };
 use crate::transport::{data_object, decode_data_response, enc, enc_path, Transport};
 use crate::{Error, JsonObject, Result};
@@ -51,6 +52,40 @@ impl Default for WaitOptions<'_> {
         WaitOptions {
             timeout: Duration::from_secs(60),
             on_chunk: None,
+        }
+    }
+}
+
+/// Optional parameters for [`TasksResource::wait`].
+pub struct TaskWaitOptions {
+    /// Bounds the wait.
+    pub timeout: Duration,
+    /// Caps reconnection attempts.
+    pub max_attempts: u32,
+}
+
+/// Optional parameters for [`RunsResource::wait`].
+pub struct RunWaitOptions {
+    /// Bounds the wait.
+    pub timeout: Duration,
+    /// Caps reconnection attempts.
+    pub max_attempts: u32,
+}
+
+impl Default for RunWaitOptions {
+    fn default() -> Self {
+        RunWaitOptions {
+            timeout: Duration::from_secs(60),
+            max_attempts: 5,
+        }
+    }
+}
+
+impl Default for TaskWaitOptions {
+    fn default() -> Self {
+        TaskWaitOptions {
+            timeout: Duration::from_secs(60),
+            max_attempts: 5,
         }
     }
 }
@@ -120,6 +155,10 @@ resource!(
     StreamsResource
 );
 resource!(
+    /// Reads and waits for durable asynchronous tasks.
+    TasksResource
+);
+resource!(
     /// Uploads, downloads, lists, and deletes files.
     FilesResource
 );
@@ -179,18 +218,8 @@ impl EventsResource {
         let Value::Object(body) = body else {
             unreachable!()
         };
-        let published = self.publish(body).await?;
-
-        let stream_id = string_field(&published, "stream_id");
-        let event_id = string_field(&published, "event_id");
-        let run = wait_for_run_result(
-            self.transport.clone(),
-            &stream_id,
-            &event_id,
-            opts.timeout,
-            opts.on_chunk,
-        )
-        .await?;
+        let run =
+            wait_for_call_result(self.transport.clone(), body, opts.timeout, opts.on_chunk).await?;
         Ok(extract_run_result(run.get("result").cloned()))
     }
 
@@ -245,6 +274,29 @@ impl RunsResource {
             .request_json(Method::GET, &path, None, &[])
             .await?;
         Ok(data_object(envelope))
+    }
+
+    /// Streams durable run:update snapshots until the run is terminal.
+    pub fn subscribe(&self, run_id: &str) -> EventStream {
+        iter_stream(
+            self.transport.clone(),
+            Method::GET,
+            format!("/runs/{}/subscribe", enc(run_id)),
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// Waits for successful run completion. Failed and cancelled runs return
+    /// [`Error::RunWaitFailed`] with the final durable snapshot.
+    pub async fn wait(&self, run_id: &str, opts: RunWaitOptions) -> Result<JsonObject> {
+        wait_for_run(
+            self.transport.clone(),
+            run_id,
+            opts.timeout,
+            opts.max_attempts,
+        )
+        .await
     }
 }
 
@@ -364,6 +416,7 @@ impl StreamsResource {
             let mut seen_start: HashSet<String> = HashSet::new();
             let mut seen_terminal: HashSet<String> = HashSet::new();
             let mut stream_id: Option<String> = None;
+            let mut event_id: Option<String> = None;
             let mut attempts: u32 = 0;
 
             loop {
@@ -398,6 +451,11 @@ impl StreamsResource {
                             {
                                 stream_id = Some(published.to_string());
                             }
+                            if let Some(published) =
+                                event.get("event_id").and_then(Value::as_str)
+                            {
+                                event_id = Some(published.to_string());
+                            }
                         }
                         "run:start" => {
                             let run_id = event.run_id().map(str::to_string);
@@ -414,12 +472,17 @@ impl StreamsResource {
                                     continue;
                                 }
                             }
-                            terminal = true;
+                            terminal = event_id.as_deref().is_some_and(|published| {
+                                crate::streaming::event_id_of_run(event.run()) == Some(published)
+                            });
                         }
                         _ => {}
                     }
 
                     yield Ok(event);
+                    if terminal {
+                        return;
+                    }
                 }
 
                 if terminal {
@@ -431,12 +494,53 @@ impl StreamsResource {
                     ));
                     return;
                 }
+                if attempts >= opts.max_attempts {
+                    yield Err(Error::Protocol(
+                        "stream ended before the published event's run completed".to_string(),
+                    ));
+                    return;
+                }
 
                 attempts += 1;
                 let delay = Duration::from_millis((250 * u64::from(attempts)).min(2000));
                 tokio::time::sleep(delay).await;
             }
         })
+    }
+}
+
+impl TasksResource {
+    /// Returns the latest durable task snapshot.
+    pub async fn get(&self, task_id: &str) -> Result<JsonObject> {
+        let path = format!("/tasks/{}", enc(task_id));
+        let envelope = self
+            .transport
+            .request_json(Method::GET, &path, None, &[])
+            .await?;
+        Ok(data_object(envelope))
+    }
+
+    /// Streams durable task:update snapshots until the task is terminal.
+    pub fn subscribe(&self, task_id: &str) -> EventStream {
+        iter_stream(
+            self.transport.clone(),
+            Method::GET,
+            format!("/tasks/{}/subscribe", enc(task_id)),
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// Waits for successful task completion. Failed, cancelled, and timed-out
+    /// tasks return [`Error::TaskFailed`] with the final durable snapshot.
+    pub async fn wait(&self, task_id: &str, opts: TaskWaitOptions) -> Result<JsonObject> {
+        wait_for_task(
+            self.transport.clone(),
+            task_id,
+            opts.timeout,
+            opts.max_attempts,
+        )
+        .await
     }
 }
 
@@ -931,12 +1035,4 @@ fn project_query(project: Option<&str>) -> Vec<(String, String)> {
         Some(project) => vec![("project".to_string(), project.to_string())],
         None => Vec::new(),
     }
-}
-
-fn string_field(object: &JsonObject, key: &str) -> String {
-    object
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
 }
