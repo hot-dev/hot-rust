@@ -4,7 +4,10 @@
 //! skips them; the runner passes `-- --ignored`.
 
 use futures_util::StreamExt;
-use hot_dev::{CallOptions, Error, HotClient, StreamEventExt, SubscribeWithEventOptions};
+use hot_dev::{
+    CallOptions, Error, HotClient, RunWaitOptions, StreamEventExt, SubscribeWithEventOptions,
+    TaskWaitOptions,
+};
 use serde_json::json;
 
 fn client() -> HotClient {
@@ -60,6 +63,94 @@ async fn subscribe_with_event_echo() {
 
     let result = result.expect("no run:stop observed");
     assert_eq!(result["echoed"]["text"], "hello", "result = {result:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires a running hot dev (integration/run.sh)"]
+async fn wait_for_task_started_by_event_handler() {
+    let client = client();
+    let mut events = client.streams().subscribe_with_event(
+        json!({
+            "event_type": "sdk:task",
+            "event_data": { "value": "hello" },
+        }),
+        SubscribeWithEventOptions::default(),
+    );
+
+    let mut task_id = None;
+    let mut handler_run_id = None;
+    let mut stream_id = None;
+    while let Some(event) = events.next().await {
+        let event = event.unwrap();
+        match event.event_type() {
+            "run:fail" | "run:cancel" => panic!("run did not complete: {event:?}"),
+            "run:stop" => {
+                handler_run_id = event.run_id().map(str::to_string);
+                stream_id = event
+                    .run()
+                    .and_then(|run| run.get("stream_id"))
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string);
+                task_id = event
+                    .run()
+                    .and_then(|run| run.get("result"))
+                    .and_then(|result| result.get("work"))
+                    .and_then(|work| work.get("task"))
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let task_id = task_id.expect("run result did not contain work.task");
+    let handler_run = client
+        .runs()
+        .wait(
+            &handler_run_id.expect("run:stop did not include run_id"),
+            RunWaitOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(handler_run["status"], "succeeded");
+
+    let mut stream = client.streams().subscribe(
+        &stream_id.expect("run:stop did not include stream_id"),
+        None,
+    );
+    let streamed_task = loop {
+        let event = stream
+            .next()
+            .await
+            .expect("stream ended before task completed")
+            .unwrap();
+        if event.event_type() != "task:update" {
+            continue;
+        }
+        let Some(task) = event.get("task").and_then(|task| task.as_object()) else {
+            continue;
+        };
+        if task.get("task_id").and_then(|id| id.as_str()) != Some(task_id.as_str()) {
+            continue;
+        }
+        match task.get("status").and_then(|status| status.as_str()) {
+            Some("completed") => break task.clone(),
+            Some("failed" | "cancelled" | "timed_out") => {
+                panic!("task did not complete: {task:?}")
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(streamed_task["result"]["processed"], "hello");
+
+    let task = client
+        .tasks()
+        .wait(&task_id, TaskWaitOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(task["status"], "completed");
+    assert_eq!(task["result"]["processed"], "hello");
 }
 
 #[tokio::test]
