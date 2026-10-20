@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn fixture() -> Option<Value> {
-    let path = std::env::var("HOT_TEST_SUBORG_FIXTURE").ok()?;
-    Some(serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap())
+    let data = std::env::var("HOT_TEST_SUBORG_FIXTURE").ok()?;
+    Some(serde_json::from_str(&data).unwrap())
 }
 fn runtime(token: &str) -> HotClient {
     HotClient::builder(token)
