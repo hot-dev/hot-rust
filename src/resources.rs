@@ -436,7 +436,7 @@ impl StreamsResource {
                     let event = match item {
                         Ok(event) => event,
                         Err(error) => {
-                            if stream_id.is_none() || attempts >= opts.max_attempts {
+                            if error.is_authorization() || stream_id.is_none() || attempts >= opts.max_attempts {
                                 yield Err(error);
                                 return;
                             }

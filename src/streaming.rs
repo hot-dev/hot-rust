@@ -142,7 +142,7 @@ pub(crate) async fn wait_for_run_result(
                         return Ok(run);
                     }
                 }
-                Err(_error) if attempts < 5 => break,
+                Err(error) if !error.is_authorization() && attempts < 5 => break,
                 Err(error) => return Err(error),
             }
         }
@@ -186,7 +186,9 @@ pub(crate) async fn wait_for_call_result(
             let Some(item) = item else { break };
             let event = match item {
                 Ok(event) => event,
-                Err(_error) if stream_id.is_some() && attempts < 5 => break,
+                Err(error) if !error.is_authorization() && stream_id.is_some() && attempts < 5 => {
+                    break
+                }
                 Err(error) => return Err(error),
             };
             if event.event_type() == "event:published" {
@@ -242,7 +244,7 @@ pub(crate) async fn wait_for_task(
             let Some(item) = item else { break };
             let event = match item {
                 Ok(event) => event,
-                Err(_error) if attempts < max_attempts => break,
+                Err(error) if !error.is_authorization() && attempts < max_attempts => break,
                 Err(error) => return Err(error),
             };
             if event.event_type() != "task:update" {
@@ -301,7 +303,7 @@ pub(crate) async fn wait_for_run(
             let Some(item) = item else { break };
             let event = match item {
                 Ok(event) => event,
-                Err(_error) if attempts < max_attempts => break,
+                Err(error) if !error.is_authorization() && attempts < max_attempts => break,
                 Err(error) => return Err(error),
             };
             if event.event_type() != "run:update" {
