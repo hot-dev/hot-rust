@@ -58,7 +58,7 @@ async fn main() -> hot_dev::Result<()> {
 
 Authenticated clients should run server-side. Browser (wasm) apps and
 untrusted clients should call your own backend route instead of exposing a Hot
-API key. Most management endpoints require an API key. Sessions and service
+API key. Administrative runtime endpoints require an API key with appropriate grants. Sessions and service
 keys are permission-scoped and are mainly for event publishing and stream
 reads.
 
@@ -194,3 +194,92 @@ cargo doc --no-deps
 ## License
 
 Apache-2.0
+
+## Sub-organization management
+
+Requires a Hot server release containing the sub-org management API. Use the
+separate `HotManagementClient` with an `hm_` credential issued by a root admin.
+Runtime API keys, service keys, and sessions cannot call management endpoints;
+management credentials cannot call runtime endpoints. Create a runtime client
+per environment credential. A root environment key cannot access its children,
+and a child key cannot access siblings. There is no tenant or org selector on
+runtime methods. Each child owns its environments and deployments.
+
+```rust,no_run
+use hot_dev::{HotClient, HotManagementClient};
+use serde_json::json;
+# async fn example(management_token: &str) -> hot_dev::Result<()> {
+let management = HotManagementClient::new(management_token);
+let child = management.create_child(json!({
+    "name": "Customer", "slug": "customer-unique-slug",
+    "idempotency_key": "customer-provisioning-123",
+})).await?;
+let key = management.create_api_key(
+    child["org"]["org_id"].as_str().unwrap(), child["env_id"].as_str().unwrap(),
+    json!({"description": "Customer backend", "permissions": {"*:*": ["*"]}}),
+).await?;
+let customer = HotClient::new(key["token"].as_str().unwrap());
+println!("{:?}", customer.env().get().await?);
+# Ok(())
+# }
+```
+
+| Management method | Purpose |
+| --- | --- |
+| `list_children(query)` | List authorized children (returns `children` and `total`) |
+| `create_child(body)` | Provision a child and default environment |
+| `set_child_state(child_id, state)` | Set `active`, `suspended`, or `archived` (no response body) |
+| `create_environment(child_id, body)` | Provision a child environment by name |
+| `create_api_key(child_id, env_id, body)` | Issue a child API key within the delegation ceiling |
+| `usage()` | Read account-wide usage |
+
+Child creation requires a stable `idempotency_key`; reuse it for retries of the
+same request. A different payload with that key is rejected. Environment
+creation is idempotent within a child by exact name. Listing accepts `limit`
+(maximum 500) and `offset`. Account usage requires `usage:read` and explicit
+`all_children` authority. Management credentials cannot issue other management
+credentials or grant human access. Service keys and sessions are issued with the
+child environment's runtime API key and inherit its management issuer chain.
+Issuer expiry, revocation, or permission narrowing restrict existing descendants;
+expansion never expands their stored grants.
+
+Administrative runtime operations require an API key **and** the appropriate
+resource/action grants. For example, project listing requires `project:*` with
+`read`, and environment info and usage require `env:{env_id}` with `read`.
+Event-only keys receive `403` for these operations; API-key status alone does
+not grant administration. Full-access `{"*:*": ["*"]}` keys retain access.
+See the server's [permission contract](https://hot.dev/docs/api/management).
+
+`org.usage` reports only the credential's **environment consumption**, with
+`env_id`, `usage_scope: "environment"`, and `limits_scope: "billing_account"`.
+Its limits and plan come from the billing root; percentages compare this one
+environment against shared limits and do not describe remaining account quota.
+`usage.team_members` is zero because seats belong to the account. Use management
+`usage` for the account aggregate. Existing runtime endpoints and request bodies
+keep their shapes. JSON requests retain bounded 429/Retry-After handling;
+streaming reconnects and waiters stop on permanent `401`/`403` authorization errors.
+
+### Sub-org integration tests
+
+See [the validation record](integration/VALIDATION.md) for the tested server revision and results.
+
+The fixture creates an owned disposable database and loopback API server, runs
+the SDK tests, and removes only its own resources. The canonical fixture lives
+in hot-python and is synchronized across all five SDKs. No deployed credentials
+are used. Requires Python 3 and a Hot CLI built from the matching server branch.
+For PostgreSQL, also install Docker and `psql` and provide the public hot checkout
+(default: sibling `hot`). Migrations use a non-superuser schema owner; the API
+uses a distinct non-owner `NOSUPERUSER NOBYPASSRLS` login with RLS enforcement.
+The fixture's administrator seeds credentials only; SDK calls always use HTTP.
+
+```bash
+python3 integration/suborg_fixture.py --hot ../hot/target/debug/hot --backend postgres -- \
+  cargo test --test suborg_integration -- --ignored
+# For SQLite, use --backend sqlite.
+```
+
+Coverage includes provisioning and environment idempotency, identical project
+names in siblings, foreign-ID and stream denial, parent runtime isolation,
+management/runtime token separation, usage scope, restricted API-key grants,
+service/session issuance and revocation, pre-existing descendant issuer
+revocation/narrowing, and child suspension/resumption.

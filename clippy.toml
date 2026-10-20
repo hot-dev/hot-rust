@@ -1,0 +1,4 @@
+# ApiError is part of the public API and is 128 bytes on current toolchains.
+# Keep its existing by-value representation without suppressing large-error
+# checks for future growth. Boxing it would break downstream pattern matches.
+large-error-threshold = 256
