@@ -40,6 +40,7 @@
 
 mod client;
 mod error;
+mod management;
 mod resources;
 mod sse;
 mod streaming;
@@ -47,6 +48,7 @@ mod transport;
 
 pub use client::{HotClient, HotClientBuilder};
 pub use error::{ApiError, Error};
+pub use management::{HotManagementClient, HotManagementClientBuilder};
 pub use resources::{
     BuildUpload, BuildsResource, CallOptions, ContextResource, DomainsResource, EnvResource,
     EventsResource, FilesResource, OrgResource, ProjectsResource, RunWaitOptions, RunsResource,

@@ -115,3 +115,9 @@ fn retry_after(value: Option<&Value>, headers: &HeaderMap) -> Option<u64> {
         .and_then(|header| header.to_str().ok())
         .and_then(|header| header.parse().ok())
 }
+
+impl Error {
+    pub(crate) fn is_authorization(&self) -> bool {
+        matches!(self, Self::Api(error) if matches!(error.status_code, 401 | 403))
+    }
+}

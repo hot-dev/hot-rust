@@ -19,6 +19,21 @@ use serde_json::Value;
 
 fn coverage() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
+        ("GET /v1/management/children", "management.list_children"),
+        ("POST /v1/management/children", "management.create_child"),
+        (
+            "PATCH /v1/management/children/{child_id}/state",
+            "management.set_child_state",
+        ),
+        (
+            "POST /v1/management/children/{child_id}/environments",
+            "management.create_environment",
+        ),
+        (
+            "POST /v1/management/children/{child_id}/environments/{env_id}/api-keys",
+            "management.create_api_key",
+        ),
+        ("GET /v1/management/usage", "management.usage"),
         // "" marks operations intentionally left out of the SDK.
         ("GET /status", ""), // public health endpoint
         ("GET /v1/projects", "projects.list"),
@@ -158,6 +173,17 @@ async fn method_exists(client: hot_dev::HotClient) -> hot_dev::Result<()> {
     use hot_dev::{
         BuildUpload, CallOptions, SubscribeWithEventOptions, TaskWaitOptions, WaitOptions,
     };
+    let management = hot_dev::HotManagementClient::new("hm_test");
+    let _ = management.list_children(&[]).await?;
+    let _ = management.create_child(serde_json::json!({})).await?;
+    management.set_child_state("c", "suspended").await?;
+    let _ = management
+        .create_environment("c", serde_json::json!({}))
+        .await?;
+    let _ = management
+        .create_api_key("c", "e", serde_json::json!({}))
+        .await?;
+    let _ = management.usage().await?;
     let body = serde_json::Map::new();
     let q: &[(&str, &str)] = &[];
 
