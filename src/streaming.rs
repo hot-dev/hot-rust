@@ -331,9 +331,6 @@ pub(crate) async fn wait_for_run(
     unreachable!()
 }
 
-// Keep the public Error::Api(ApiError) shape stable for the 1.x SDK. Boxing
-// that variant only to shrink this internal Result would be a breaking change.
-#[allow(clippy::result_large_err)]
 fn handle_run_event(
     event: &StreamEvent,
     event_id: &str,

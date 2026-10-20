@@ -1,0 +1,4 @@
+# Keep the public Error::Api(ApiError) shape stable throughout the 1.x SDK.
+# Boxing the variant would break callers that construct or match API errors.
+# Continue checking other error types against Clippy's default size limit.
+large-error-ignored = ["hot_dev::error::Error"]
