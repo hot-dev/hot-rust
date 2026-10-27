@@ -161,6 +161,19 @@ Do not set a client-wide timeout on a client used for SSE subscriptions — it
 bounds the whole request, including the stream. Use the builder's `timeout`
 (JSON requests only) instead.
 
+### TLS dependency updates
+
+The SDK requires `rustls` 0.23.46, `rustls-webpki` 0.103.16, and
+`webpki-roots` 1.0.10 or newer compatible versions. These minimums apply to
+applications using the published crate, independently of this repository's
+lockfile.
+
+When updating an existing application, refresh its TLS dependencies and rebuild:
+
+```bash
+cargo update -p rustls -p rustls-webpki -p webpki-roots
+```
+
 ## Request Bodies
 
 Body parameters accept any `serde::Serialize` value: `serde_json::json!`
