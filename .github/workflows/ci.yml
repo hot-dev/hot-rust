@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly: new advisories, and org API drift against hot main.
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -43,6 +47,19 @@ jobs:
         run: cargo doc --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # Known vulnerabilities and yanked versions in Cargo.lock (deny.toml).
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Check advisories
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
 
   # The MSRV promise applies to consumers of the library, so this leg builds
   # only the library and its dependency tree (`cargo check` skips
@@ -88,7 +105,7 @@ jobs:
         run: ./integration/run.sh
 
   postgres-isolation:
-    name: PostgreSQL Sub-org Isolation
+    name: Org API isolation (PostgreSQL)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -104,15 +121,17 @@ jobs:
 
       # A released CLI may lag these API changes. Pin the tested server source
       # separately so its schema, runtime qualification, and OpenAPI agree.
+      # The weekly run builds hot main instead, to catch API drift early.
       - name: Checkout matching Hot server
         uses: actions/checkout@v5
         with:
           repository: hot-dev/hot
-          ref: d5dde712f447daf88c38e5546f805496c46a2877 # Keep aligned with integration/hot-server.ref
+          ref: ${{ github.event_name == 'schedule' && 'main' || 'd5dde712f447daf88c38e5546f805496c46a2877' }} # Keep the pin aligned with integration/hot-server.ref
           path: .hot-server
           persist-credentials: false
 
       - name: Verify matching Hot revision
+        if: github.event_name != 'schedule'
         shell: bash
         run: |
           expected="$(cat integration/hot-server.ref)"
@@ -144,7 +163,7 @@ jobs:
           workspaces: .hot-server -> target
           key: postgres-isolation-${{ hashFiles('integration/hot-server.ref') }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
 
       - name: Install Tailwind for the server build
         shell: bash

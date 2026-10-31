@@ -11,6 +11,8 @@ documentation = "https://docs.rs/hot-dev"
 readme = "README.md"
 keywords = ["hot", "sdk", "api", "events", "sse"]
 categories = ["api-bindings", "web-programming::http-client"]
+# Publish the library only; tests, CI and the integration fixture stay in git.
+include = ["/src", "/README.md", "/LICENSE", "/NOTICE"]
 
 [dependencies]
 async-stream = "0.3"
