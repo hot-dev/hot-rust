@@ -6,9 +6,9 @@ use reqwest::{Method, RequestBuilder, Response};
 use serde_json::Value;
 
 use crate::resources::{
-    ApiKeysResource, BuildsResource, ContextResource, DomainsResource, EnvResource, EventsResource,
-    FilesResource, OrgResource, OrgsResource, ProjectsResource, RunsResource, ServiceKeysResource,
-    SessionsResource, StreamsResource, TasksResource,
+    ApiKeysResource, BlobsResource, BuildsResource, ContextResource, DomainsResource, EnvResource,
+    EventsResource, FilesResource, OrgResource, OrgsResource, ProjectsResource, RunsResource,
+    ServiceKeysResource, SessionsResource, StreamsResource, TasksResource,
 };
 use crate::transport::{authorization, Transport, DEFAULT_BASE_URL};
 use crate::{JsonObject, Result};
@@ -55,6 +55,12 @@ impl HotClient {
     /// The configured base URL without the /v1 suffix.
     pub fn base_url(&self) -> &str {
         self.transport.base_url()
+    }
+
+    /// Blobs that Hot spilled large payloads to. Requires an environment API
+    /// key.
+    pub fn blobs(&self) -> BlobsResource {
+        BlobsResource::new(self.transport.clone())
     }
 
     pub fn builds(&self) -> BuildsResource {
