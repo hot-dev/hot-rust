@@ -192,3 +192,59 @@ async fn run_failure_message() {
         "{error:?}"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a running hot dev (integration/run.sh)"]
+async fn call_hot_delivers_chunks_sent_before_run_start() {
+    let client = client();
+    let mut chunks = Vec::new();
+    let mut on_chunk = |text: &str| chunks.push(text.to_string());
+    let result = client
+        .events()
+        .call_hot(
+            "::fixture::sdk/stream-chunks",
+            vec![],
+            CallOptions {
+                on_chunk: Some(&mut on_chunk),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, json!("done"));
+    assert_eq!(chunks, ["a", "b", "c"]);
+}
+
+#[tokio::test]
+#[ignore = "requires a running hot dev (integration/run.sh)"]
+async fn retried_handler_reports_the_retry_result() {
+    let client = client();
+    let published = client
+        .events()
+        .publish(json!({ "event_type": "sdk:flaky", "event_data": {} }))
+        .await
+        .unwrap();
+    let run = client
+        .streams()
+        .wait_for_run_result(
+            published["stream_id"].as_str().unwrap(),
+            published["event_id"].as_str().unwrap(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(run["result"]["recovered"], true, "{run:?}");
+    assert!(run["origin_run_id"].is_string(), "{run:?}");
+
+    let mut events = client.streams().subscribe_with_event(
+        json!({ "event_type": "sdk:flaky", "event_data": {} }),
+        SubscribeWithEventOptions::default(),
+    );
+    let mut last = None;
+    while let Some(event) = events.next().await {
+        last = Some(event.unwrap());
+    }
+    let last = last.unwrap();
+    assert_eq!(last.event_type(), "run:stop", "{last:?}");
+    assert_eq!(last.run().unwrap()["result"]["recovered"], true);
+}

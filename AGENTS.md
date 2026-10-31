@@ -25,12 +25,19 @@ cargo doc --no-deps
 
 ## Layout
 
-- `src/client.rs` / `src/transport.rs` — builder, authorized requests, envelope handling
-- `src/streaming.rs` — SSE event streams, wait_for_run_result
-- `src/resources.rs` — all 12 resources (port of hot-python's resources.py)
+- `src/client.rs` / `src/transport.rs` — builder, authorized requests, envelope
+  handling, JSON request timeout and retries
+- `src/error.rs` — `Error`, `ApiError`, `KeyScope` (`403 key_scope_mismatch`)
+- `src/streaming.rs` — SSE event streams, the shared reconnect policy
+  (`Reconnect`), and `RunTracker`, which ties runs to a published event
+  (retries via `origin_run_id`, chunks that arrive before `run:start`)
+- `src/resources.rs` — the runtime resources (port of hot-python's
+  resources.py) plus the org API (`OrgsResource`, `OrgEnv`, `ApiKeysResource`)
 - `tests/openapi_coverage.rs` — every OpenAPI operation must map to an SDK
   method or carry an explicit ignore; `method_exists` pins method names at
   compile time. Fixture in `tests/fixtures/`.
+- `tests/reconnect.rs`, `tests/run_events.rs` — reconnect policy and run
+  correlation against wiremock servers. README snippets compile as doctests.
 
 ## CI and Releases
 
@@ -63,11 +70,13 @@ the matching `@hot-dev/sdk` JavaScript release when possible.
 `integration/run.sh` starts a scratch `hot dev` (requires the `hot` CLI and
 python3 on PATH) serving the Hot fixture project in `integration/fixture`
 (project `sdk-fixture`: an echo event handler, an always-failing handler and
+function, a handler that fails its first attempt and is retried, a streaming
 function, and hot:call targets). It binds 127.0.0.1 on HOT_TEST_PORT (default
 4722), mints a full-access API key directly in the fixture's sqlite database,
 exports HOT_TEST_BASE_URL / HOT_TEST_API_KEY, and runs the `#[ignore]`d tests in tests/integration.rs via `cargo test --test integration -- --ignored`.
 The integration tests skip when HOT_TEST_API_KEY is unset, so regular test
-runs are unaffected. The fixture pins the API to 127.0.0.1 because binding
+runs are unaffected. `integration/suborg_fixture.py` runs `tests/suborg_integration.rs`
+against a Hot build from `integration/hot-server.ref` with an org API key. The fixture pins the API to 127.0.0.1 because binding
 "localhost" can yield an IPv6-only listener that JDK-style clients (which
 dial the first resolved address only) cannot reach.
 

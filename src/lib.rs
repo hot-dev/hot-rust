@@ -40,22 +40,26 @@
 
 mod client;
 mod error;
-mod management;
 mod resources;
 mod sse;
 mod streaming;
 mod transport;
 
 pub use client::{HotClient, HotClientBuilder};
-pub use error::{ApiError, Error};
-pub use management::{HotManagementClient, HotManagementClientBuilder};
+pub use error::{ApiError, Error, KeyScope};
 pub use resources::{
-    BuildUpload, BuildsResource, CallOptions, ContextResource, DomainsResource, EnvResource,
-    EventsResource, FilesResource, OrgResource, ProjectsResource, RunWaitOptions, RunsResource,
-    ServiceKeysResource, SessionsResource, StreamsResource, SubscribeWithEventOptions,
-    TaskWaitOptions, TasksResource, WaitOptions,
+    ApiKeysResource, BuildUpload, BuildsResource, CallOptions, ContextResource, DomainsResource,
+    EnvResource, EventsResource, FilesResource, OrgEnv, OrgResource, OrgsResource,
+    ProjectsResource, RunWaitOptions, RunsResource, ServiceKeysResource, SessionsResource,
+    StreamsResource, SubscribeWithEventOptions, TaskWaitOptions, TasksResource, WaitOptions,
 };
 pub use streaming::{EventStream, StreamEventExt};
+
+/// The `reqwest` version this SDK uses, for
+/// [`HotClientBuilder::http_client`]: build the client with
+/// `hot_dev::reqwest::Client::builder()` so the types match whatever
+/// `reqwest` your application depends on.
+pub use reqwest;
 
 /// A JSON object in the Hot API wire format.
 pub type JsonObject = serde_json::Map<String, serde_json::Value>;
@@ -65,3 +69,8 @@ pub type StreamEvent = JsonObject;
 
 /// Result alias for SDK operations.
 pub type Result<T> = std::result::Result<T, Error>;
+
+// Compiles every Rust snippet in the README as a doctest.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

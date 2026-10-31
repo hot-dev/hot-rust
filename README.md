@@ -96,6 +96,30 @@ timed-out tasks return a structured error with the final task record.
 The task's parent stream also emits durable `task:update` events, which is
 useful when one subscription needs to coordinate several tasks.
 
+### Reconnects
+
+The durable helpers (`runs().wait`, `tasks().wait`,
+`streams().wait_for_run_result`, `events().call_hot`, and
+`streams().subscribe_with_event`) share one reconnect policy:
+
+- Permanent errors end the wait at once: every 4xx except 408 and 429 (for
+  example a revoked key's `401`, a `403`, or a `404`).
+- Transport errors, dead connections (nothing, not even a keepalive, for 45
+  seconds), `408`, `429`, and `5xx` reconnect with jittered exponential
+  backoff (0.25–0.5 s, doubling to at most 5–10 s), waiting at least the
+  server's `retry_after`.
+- `max_attempts` (default 5) caps *consecutive* failed connections. A
+  connection that delivers events resets the count, and the API's routine
+  5-minute rollover (`stream:complete`) reconnects at once, so a run of any
+  length can be awaited.
+- The `timeout` bounds everything, backoff included: a wait never outlives it.
+
+Run-result helpers follow handler retries: a run that fails with status
+`pending_retry` is not the result, and the retry run (linked by
+`origin_run_id`) is followed instead. Streamed `on_chunk` text is buffered
+per run, so chunks that arrive before `run:start` are still delivered, in
+order.
+
 ## Errors
 
 Non-2xx API responses return `Error::Api(ApiError)` with structured fields:
@@ -114,11 +138,18 @@ match client.projects().get("missing-project").await {
 # }
 ```
 
+For a `403 key_scope_mismatch`, `error.required_scope()` returns the kind of
+key the call needs (`KeyScope::Org` or `KeyScope::Env`): see
+[Org API keys](#org-api-keys).
+
 ### Retries
 
 JSON requests are retried automatically (at most twice) when the API responds
-429 with a `retry_after`; other errors are returned as-is. Streaming and raw
-requests are never retried.
+429 with a `retry_after`, and idempotent ones (`GET`, `PUT`, `DELETE`) also on
+502, 503, or 504; other errors are returned as-is. Each JSON request is bounded
+by the builder's `timeout` (default 60 seconds). Raw requests (uploads and
+downloads) are never retried; streaming helpers reconnect as described under
+[Reconnects](#reconnects).
 
 ## Resources
 
@@ -136,7 +167,14 @@ requests are never retried.
 - `client.sessions()` — create and revoke scoped sessions
 - `client.service_keys()` — create and revoke scoped service keys
 - `client.org()` — view usage and limits
-- `client.env()` — read environment info and subscribe to environment events
+- `client.env()` — read environment info, subscribe to environment events, and purge call traces
+- `client.orgs()` and `client.api_keys()` — child organizations, environments, and API keys, with an org API key (see [Org API keys](#org-api-keys))
+
+List helpers return the first page of results (`data` plus `pagination` with
+`total`, `limit`, `offset`, and `has_more`). Methods that take a `query` accept
+`limit` (up to 500) and `offset`; `context().list_with_query`,
+`domains().list_with_query`, `projects().event_handlers_with_query`, and
+`projects().schedules_with_query` page the helpers that take none.
 
 Use `client.request(...)` for JSON endpoints that do not yet have a resource
 helper, or `client.request_builder(...)` + `client.execute(...)` for full
@@ -150,12 +188,19 @@ runs on the same stream do not end the iterator.
 
 ## Customizing the HTTP Client
 
-Pass your own `reqwest::Client` for proxies, pools, or custom TLS:
+Pass your own `reqwest::Client` for proxies, pools, or custom TLS. Build it
+with the `reqwest` the SDK re-exports, so the types match whatever `reqwest`
+version your application uses:
 
 ```rust,no_run
-let http = reqwest::Client::builder().build().unwrap();
+let http = hot_dev::reqwest::Client::builder().build().unwrap();
 let client = hot_dev::HotClient::builder("token").http_client(http).build();
 ```
+
+Tokens are trimmed, so one read from a file or secret store with a trailing
+newline works. A token that is still not a valid header value fails every
+request before it is sent; `HotClientBuilder::try_build` reports it when the
+client is built instead.
 
 Do not set a client-wide timeout on a client used for SSE subscriptions — it
 bounds the whole request, including the stream. Use the builder's `timeout`
@@ -163,12 +208,12 @@ bounds the whole request, including the stream. Use the builder's `timeout`
 
 ### TLS dependency updates
 
-The SDK requires `rustls` 0.23.46, `rustls-webpki` 0.103.16, and
-`webpki-roots` 1.0.10 or newer compatible versions. These minimums apply to
-applications using the published crate, independently of this repository's
-lockfile.
+Since 1.3.0 the SDK requires `rustls` 0.23.46, `rustls-webpki` 0.103.16, and
+`webpki-roots` 1.0.10 or newer compatible versions (RUSTSEC-2026-0346 to 0349,
+0381, 0382). These minimums apply to applications using the published crate,
+independently of this repository's lockfile.
 
-When updating an existing application, refresh its TLS dependencies and rebuild:
+When upgrading an existing application, refresh its TLS dependencies and rebuild:
 
 ```bash
 cargo update -p rustls -p rustls-webpki -p webpki-roots
@@ -208,82 +253,72 @@ cargo doc --no-deps
 
 Apache-2.0
 
-## Sub-organization management
+## Org API keys
 
-Requires a Hot server release containing the sub-org management API. Use the
-separate `HotManagementClient` with an `hm_` credential issued by a root admin.
-Runtime API keys, service keys, and sessions cannot call management endpoints;
-management credentials cannot call runtime endpoints. Create a runtime client
-per environment credential. A root environment key cannot access its children,
-and a child key cannot access siblings. There is no tenant or org selector on
-runtime methods. Each child owns its environments and deployments.
+Requires Hot 3.0.1 or later. An org API key belongs to a root organization and
+calls only the control-plane routes: `client.orgs()` and `client.api_keys()`.
+It provisions child organizations and their environments and mints
+environment API keys there. Runtime calls (events, streams, runs, and the rest)
+need an environment API key; use a separate `HotClient` per environment key. A
+call with the wrong kind of key returns `403 key_scope_mismatch`, and
+`error.required_scope()` names the key the call needs.
 
 ```rust,no_run
-use hot_dev::{HotClient, HotManagementClient};
+use hot_dev::{HotClient, KeyScope};
 use serde_json::json;
-# async fn example(management_token: &str) -> hot_dev::Result<()> {
-let management = HotManagementClient::new(management_token);
-let child = management.create_child(json!({
-    "name": "Customer", "slug": "customer-unique-slug",
+# async fn example(org_key: &str) -> hot_dev::Result<()> {
+let org = HotClient::new(org_key);
+// Keep the idempotency key stable across retries. Slugs have at most 32 characters.
+let child = org.orgs().create(json!({
+    "name": "Customer", "slug": "customer-123",
     "idempotency_key": "customer-provisioning-123",
 })).await?;
-let key = management.create_api_key(
-    child["org"]["org_id"].as_str().unwrap(), child["env_id"].as_str().unwrap(),
-    json!({"description": "Customer backend", "permissions": {"*:*": ["*"]}}),
-).await?;
+let org_id = child["org"]["org_id"].as_str().unwrap();
+let env_id = child["env_id"].as_str().unwrap();
+let key = org.orgs().create_env_api_key(org_id, env_id, json!({
+    "description": "Customer backend",
+    "permissions": {"event:*": ["create", "read"], "stream:*": ["read"]},
+})).await?;
+
 let customer = HotClient::new(key["token"].as_str().unwrap());
-println!("{:?}", customer.env().get().await?);
+customer.events().publish(json!({"event_type": "app:hello", "event_data": {}})).await?;
+
+// The org key cannot make runtime calls.
+let error = org.events().list(&[]).await.unwrap_err();
+assert_eq!(error.required_scope(), Some(KeyScope::Env));
 # Ok(())
 # }
 ```
 
-| Management method | Purpose |
+| Method | Route |
 | --- | --- |
-| `list_children(query)` | List authorized children (returns `children` and `total`) |
-| `create_child(body)` | Provision a child and default environment |
-| `set_child_state(child_id, state)` | Set `active`, `suspended`, or `archived` (no response body) |
-| `create_environment(child_id, body)` | Provision a child environment by name |
-| `create_api_key(child_id, env_id, body)` | Issue a child API key within the delegation ceiling |
-| `usage()` | Read account-wide usage |
+| `orgs().list(query)` | `GET /v1/orgs` (children the key may read) |
+| `orgs().create(body)` | `POST /v1/orgs` (returns `org`, `env_id`, `created`) |
+| `orgs().get(org_id)` / `orgs().update(org_id, {"state": ...})` | `GET`/`PATCH /v1/orgs/{org_id}` (`active`, `suspended`, `archived`) |
+| `orgs().usage(root_org_id)` | `GET /v1/orgs/{org_id}/usage` (account usage; the root's ID) |
+| `orgs().purge_calls(org_id, include_sub_orgs)` | `DELETE /v1/orgs/{org_id}/calls` |
+| `orgs().list_envs(org_id)` / `create_env` / `get_env` | `/v1/orgs/{org_id}/envs` |
+| `orgs().list_api_keys(org_id)` / `create_api_key` | `/v1/orgs/{org_id}/api-keys` (org keys) |
+| `orgs().list_env_api_keys(org_id, env_id, query)` / `create_env_api_key` | `/v1/orgs/{org_id}/envs/{env_id}/api-keys` |
+| `api_keys().get` / `update` / `revoke` / `rotate(key_id, overlap_seconds)` | `/v1/api-keys/{key_id}` |
+| `orgs().env(org_id, env_id).projects()` / `.builds()` / `.context()` | projects, builds, deploys, and context in that environment |
 
-Child creation requires a stable `idempotency_key`; reuse it for retries of the
-same request. A different payload with that key is rejected. Environment
-creation is idempotent within a child by exact name. Listing accepts `limit`
-(maximum 500) and `offset`. Account usage requires `usage:read` and explicit
-`all_children` authority. Management credentials cannot issue other management
-credentials or grant human access. Service keys and sessions are issued with the
-child environment's runtime API key and inherit its management issuer chain.
-Issuer expiry, revocation, or permission narrowing restrict existing descendants;
-expansion never expands their stored grants.
-
-Administrative runtime operations require an API key **and** the appropriate
-resource/action grants. For example, project listing requires `project:*` with
-`read`, and environment info and usage require `env:{env_id}` with `read`.
-Event-only keys receive `403` for these operations; API-key status alone does
-not grant administration. Full-access `{"*:*": ["*"]}` keys retain access.
-See the server's [permission contract](https://hot.dev/docs/api/management).
-
-`org.usage` reports only the credential's **environment consumption**, with
-`env_id`, `usage_scope: "environment"`, and `limits_scope: "billing_account"`.
-Its limits and plan come from the billing root; percentages compare this one
-environment against shared limits and do not describe remaining account quota.
-`usage.team_members` is zero because seats belong to the account. Use management
-`usage` for the account aggregate. Existing runtime endpoints and request bodies
-keep their shapes. JSON requests retain bounded 429/Retry-After handling;
-streaming reconnects and waiters stop on permanent `401`/`403` authorization errors.
+Grants use qualified resources such as `org:*` (children), `org:*/env:*`, and
+`org:*/env:*/project:*`; a key can only mint keys within its own grants, and
+revoking or narrowing a key restricts everything it issued. See the server's
+[org API documentation](https://hot.dev/docs/api/management).
 
 ### Sub-org integration tests
 
-See [the validation record](integration/VALIDATION.md) for the tested server revision and results.
-
-The fixture creates an owned disposable database and loopback API server, runs
-the SDK tests, and removes only its own resources. The canonical fixture lives
-in hot-python and is synchronized across all five SDKs. No deployed credentials
-are used. Requires Python 3 and a Hot CLI built from the matching server branch.
-For PostgreSQL, also install Docker and `psql` and provide the public hot checkout
-(default: sibling `hot`). Migrations use a non-superuser schema owner; the API
-uses a distinct non-owner `NOSUPERUSER NOBYPASSRLS` login with RLS enforcement.
-The fixture's administrator seeds credentials only; SDK calls always use HTTP.
+The fixture in `integration/suborg_fixture.py` creates an owned disposable
+database and loopback API server, seeds an org API key and a root environment
+key, runs the SDK tests, and removes only its own resources. The canonical
+fixture lives in hot-python and is synchronized across all five SDKs. It needs
+Python 3 and a Hot CLI built from the server revision in
+`integration/hot-server.ref`. For PostgreSQL, also install Docker and `psql`
+and provide that hot checkout (default: sibling `hot`). Migrations use a
+non-superuser schema owner; the API uses a distinct non-owner
+`NOSUPERUSER NOBYPASSRLS` login with RLS enforcement.
 
 ```bash
 python3 integration/suborg_fixture.py --hot ../hot/target/debug/hot --backend postgres -- \
@@ -291,8 +326,10 @@ python3 integration/suborg_fixture.py --hot ../hot/target/debug/hot --backend po
 # For SQLite, use --backend sqlite.
 ```
 
-Coverage includes provisioning and environment idempotency, identical project
-names in siblings, foreign-ID and stream denial, parent runtime isolation,
-management/runtime token separation, usage scope, restricted API-key grants,
-service/session issuance and revocation, pre-existing descendant issuer
-revocation/narrowing, and child suspension/resumption.
+Coverage includes child and environment provisioning and idempotency,
+identical project names in siblings, foreign-ID and stream denial, parent
+runtime isolation, key-scope errors in both directions, key narrowing,
+rotation and revocation, project and context routes through an org key,
+paginated context lists, service and session issuance and revocation, issuer
+revocation and narrowing of existing descendants, and child suspension and
+resumption.

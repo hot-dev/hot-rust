@@ -1,19 +1,27 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::header::InvalidHeaderValue;
 use reqwest::{Method, RequestBuilder, Response};
 use serde_json::Value;
 
 use crate::resources::{
-    BuildsResource, ContextResource, DomainsResource, EnvResource, EventsResource, FilesResource,
-    OrgResource, ProjectsResource, RunsResource, ServiceKeysResource, SessionsResource,
-    StreamsResource, TasksResource,
+    ApiKeysResource, BuildsResource, ContextResource, DomainsResource, EnvResource, EventsResource,
+    FilesResource, OrgResource, OrgsResource, ProjectsResource, RunsResource, ServiceKeysResource,
+    SessionsResource, StreamsResource, TasksResource,
 };
-use crate::transport::{Transport, DEFAULT_BASE_URL};
+use crate::transport::{authorization, Transport, DEFAULT_BASE_URL};
 use crate::{JsonObject, Result};
 
 /// Hot API v1 client. Construct it with [`HotClient::builder`]; the resource
 /// accessors mirror the Hot API resources.
+///
+/// One client works with either kind of API key. Environment keys (and the
+/// sessions and service keys they issue) call the runtime resources; org API
+/// keys call only [`HotClient::orgs`] and [`HotClient::api_keys`]. Calling
+/// the other kind's routes returns a `403 key_scope_mismatch`
+/// [`crate::ApiError`] whose [`crate::ApiError::required_scope`] names the
+/// key the call needs.
 #[derive(Clone)]
 pub struct HotClient {
     transport: Arc<Transport>,
@@ -33,8 +41,8 @@ impl HotClient {
         HotClient::builder(token).build()
     }
 
-    /// Returns a builder using the given Hot API key, session token, or
-    /// service key.
+    /// Returns a builder using the given Hot API key (environment or org),
+    /// session token, or service key. Surrounding whitespace is removed.
     pub fn builder(token: impl Into<String>) -> HotClientBuilder {
         HotClientBuilder {
             token: token.into(),
@@ -75,6 +83,18 @@ impl HotClient {
 
     pub fn org(&self) -> OrgResource {
         OrgResource::new(self.transport.clone())
+    }
+
+    /// Child organizations, their environments, and API keys. Requires an
+    /// org API key.
+    pub fn orgs(&self) -> OrgsResource {
+        OrgsResource::new(self.transport.clone())
+    }
+
+    /// Org and environment API keys by ID: read, narrow, rotate, revoke.
+    /// Requires an org API key.
+    pub fn api_keys(&self) -> ApiKeysResource {
+        ApiKeysResource::new(self.transport.clone())
     }
 
     pub fn projects(&self) -> ProjectsResource {
@@ -136,7 +156,8 @@ impl HotClientBuilder {
         self
     }
 
-    /// Bounds each JSON request. Not applied to streaming or raw requests.
+    /// Bounds each JSON request (default 60 seconds). Not applied to
+    /// streaming or raw requests; waiters take their own timeouts.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -150,10 +171,27 @@ impl HotClientBuilder {
         self
     }
 
+    /// Builds the client. A token that is not a valid HTTP header value
+    /// even after trimming (for example one with an embedded newline) makes
+    /// every request fail with a request-builder [`crate::Error::Http`]
+    /// before anything is sent; use [`HotClientBuilder::try_build`] to reject
+    /// it here instead.
     pub fn build(self) -> HotClient {
+        let authorization = authorization(&self.token).ok();
+        self.finish(authorization)
+    }
+
+    /// Builds the client, or returns an error when the token is not a valid
+    /// HTTP header value after trimming surrounding whitespace.
+    pub fn try_build(self) -> std::result::Result<HotClient, InvalidHeaderValue> {
+        let authorization = authorization(&self.token)?;
+        Ok(self.finish(Some(authorization)))
+    }
+
+    fn finish(self, authorization: Option<reqwest::header::HeaderValue>) -> HotClient {
         HotClient {
             transport: Arc::new(Transport::new(
-                self.token,
+                authorization,
                 self.base_url,
                 self.timeout,
                 self.client,
