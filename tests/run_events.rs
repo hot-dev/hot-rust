@@ -292,3 +292,93 @@ async fn subscribe_with_event_follows_replayed_retries() {
     }
     assert_eq!(last.unwrap().run_id(), Some("b"));
 }
+
+// A task started by our run names it as origin, on the same stream, but is
+// not a retry: its run_type is "task".
+const OUR_START: &str = r#"{"type":"run:start","run":{"run_id":"r1","event_id":"e1","run_type":"call","status":"running"}}"#;
+const OUR_STOP: &str = r#"{"type":"run:stop","run":{"run_id":"r1","event_id":"e1","run_type":"call","status":"succeeded","result":{"$ok":"ours"}}}"#;
+const TASK_START: &str = r#"{"type":"run:start","run":{"run_id":"t1","event_id":"e9","origin_run_id":"r1","run_type":"task","status":"running"}}"#;
+const TASK_STOP: &str = r#"{"type":"run:stop","run":{"run_id":"t1","event_id":"e9","origin_run_id":"r1","run_type":"task","status":"succeeded","result":{"$ok":"task result"}}}"#;
+const TASK_FAIL: &str = r#"{"type":"run:fail","run":{"run_id":"t1","event_id":"e9","origin_run_id":"r1","run_type":"task","status":"failed","result":"task failed"}}"#;
+const TASK_CHUNK: &str =
+    r#"{"type":"stream:data","run_id":"t1","payload":{"text":"from the task"}}"#;
+
+#[tokio::test]
+async fn task_runs_started_by_our_run_do_not_end_or_alter_the_result() {
+    for events in [
+        &[
+            PUBLISHED, OUR_START, TASK_START, TASK_CHUNK, TASK_STOP, OUR_STOP,
+        ][..],
+        // The task finishes before our run is known.
+        &[PUBLISHED, TASK_CHUNK, TASK_STOP, OUR_START, OUR_STOP][..],
+        &[PUBLISHED, OUR_START, TASK_FAIL, OUR_STOP][..],
+    ] {
+        let (_server, client) =
+            server_with("/v1/streams/subscribe-with-event", "POST", events).await;
+        let mut chunks = Vec::new();
+        let mut on_chunk = |text: &str| chunks.push(text.to_string());
+        let result = client
+            .events()
+            .call_hot(
+                "f",
+                vec![],
+                CallOptions {
+                    on_chunk: Some(&mut on_chunk),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, json!("ours"));
+        assert!(chunks.is_empty(), "{chunks:?}");
+
+        let (_server, client) = server_with("/v1/streams/s1/subscribe", "GET", &events[1..]).await;
+        let run = client
+            .streams()
+            .wait_for_run_result("s1", "e1", Default::default())
+            .await
+            .unwrap();
+        assert_eq!(run["run_id"], "r1");
+    }
+}
+
+#[tokio::test]
+async fn our_failure_still_fails_at_once_when_it_started_a_task() {
+    let our_fail = r#"{"type":"run:fail","run":{"run_id":"r1","event_id":"e1","run_type":"call","status":"failed","retry_attempt":0,"result":"boom"}}"#;
+    for events in [
+        &[PUBLISHED, OUR_START, TASK_START, TASK_STOP, our_fail][..],
+        &[PUBLISHED, TASK_STOP, OUR_START, our_fail][..],
+    ] {
+        let (_server, client) =
+            server_with("/v1/streams/subscribe-with-event", "POST", events).await;
+        let started = std::time::Instant::now();
+        let error = client
+            .events()
+            .call_hot("f", vec![], CallOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::RunFailed(message) if message == "boom"),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+}
+
+#[tokio::test]
+async fn subscribe_with_event_is_not_ended_by_a_task_run() {
+    let (_server, client) = server_with(
+        "/v1/streams/subscribe-with-event",
+        "POST",
+        &[PUBLISHED, OUR_START, TASK_START, TASK_STOP, OUR_STOP],
+    )
+    .await;
+    let mut stream = client
+        .streams()
+        .subscribe_with_event(json!({}), SubscribeWithEventOptions::default());
+    let mut last = None;
+    while let Some(event) = stream.next().await {
+        last = Some(event.unwrap());
+    }
+    assert_eq!(last.unwrap().run_id(), Some("r1"));
+}

@@ -584,9 +584,19 @@ struct PendingFailure {
     error: Error,
 }
 
+/// A run tied to the published event.
+struct TiedRun {
+    run_type: Option<String>,
+    // The highest retry_attempt seen.
+    retry_attempt: i64,
+}
+
 /// Ties runs on a stream to one published event and delivers their text
 /// chunks in order. A run belongs to the event when its `event_id` matches or
-/// its `origin_run_id` names a run that does (a retry gets a new event id).
+/// when it is a retry of a run that does: its `origin_run_id` names that run
+/// and it has the same `run_type` (a retry gets a new event id). Task runs
+/// also name the run that started them as their origin, but have `run_type`
+/// `task`, so they are not taken for retries.
 /// `stream:data` can arrive before `run:start` (and `run:start` after
 /// `run:stop`), so chunks of unknown runs wait until their run is tied.
 ///
@@ -598,8 +608,7 @@ struct PendingFailure {
 pub(crate) struct RunTracker<'a> {
     event_id: Option<String>,
     pub(crate) stream_id: Option<String>,
-    // Tied runs and the highest retry_attempt seen for each.
-    runs: HashMap<String, i64>,
+    runs: HashMap<String, TiedRun>,
     // Tied runs that a tied retry run names as its origin.
     retried: HashSet<String>,
     pending_failure: Option<PendingFailure>,
@@ -699,14 +708,17 @@ impl<'a> RunTracker<'a> {
         }
     }
 
-    /// True when the run is tied to the published event, by event id or
-    /// through its origin run.
+    /// True when the run is tied to the published event, by event id or as a
+    /// retry of a tied run.
     fn ties(&self, run: &JsonObject) -> bool {
         let by_event = self
             .event_id
             .as_deref()
             .is_some_and(|event_id| event_id_of_run(Some(run)) == Some(event_id));
-        by_event || origin_of(run).is_some_and(|origin| self.runs.contains_key(origin))
+        by_event
+            || origin_of(run)
+                .and_then(|origin| self.runs.get(origin))
+                .is_some_and(|origin| origin.run_type.as_deref() == run_type(run))
     }
 
     fn run_event(
@@ -715,7 +727,9 @@ impl<'a> RunTracker<'a> {
         run: &JsonObject,
     ) -> crate::Result<Option<JsonObject>> {
         if !self.ties(run) {
-            if let Some(origin) = origin_of(run) {
+            // A run of another type started by a tied run (a task) is not a
+            // retry; keep only runs whose origin is not known yet.
+            if let Some(origin) = origin_of(run).filter(|origin| !self.runs.contains_key(*origin)) {
                 self.orphans
                     .entry(origin.to_string())
                     .or_default()
@@ -727,9 +741,20 @@ impl<'a> RunTracker<'a> {
         let attempt = retry_attempt(run);
         let mut orphans = Vec::new();
         match self.runs.get_mut(run_id) {
-            Some(seen) => *seen = (*seen).max(attempt),
+            Some(seen) => {
+                seen.retry_attempt = seen.retry_attempt.max(attempt);
+                if seen.run_type.is_none() {
+                    seen.run_type = run_type(run).map(str::to_string);
+                }
+            }
             None => {
-                self.runs.insert(run_id.to_string(), attempt);
+                self.runs.insert(
+                    run_id.to_string(),
+                    TiedRun {
+                        run_type: run_type(run).map(str::to_string),
+                        retry_attempt: attempt,
+                    },
+                );
                 if let Some(chunks) = self.chunks.remove(run_id) {
                     for text in chunks {
                         self.chunk_bytes -= text.len();
@@ -738,7 +763,9 @@ impl<'a> RunTracker<'a> {
                         }
                     }
                 }
+                // Only orphans of the same run type are its retries.
                 orphans = self.orphans.remove(run_id).unwrap_or_default();
+                orphans.retain(|(_, orphan)| run_type(orphan) == run_type(run));
                 if !orphans.is_empty() {
                     // A retry of this run is already on the stream.
                     self.retried.insert(run_id.to_string());
@@ -785,8 +812,8 @@ impl<'a> RunTracker<'a> {
                 // retry_attempt goes up when a retry is scheduled; a run's own
                 // attempt number is its origin's (0 for the first attempt).
                 let base = origin_of(run)
-                    .and_then(|origin| self.runs.get(origin).copied())
-                    .unwrap_or(0);
+                    .and_then(|origin| self.runs.get(origin))
+                    .map_or(0, |origin| origin.retry_attempt);
                 if retry_attempt(run) > base {
                     if self.pending_failure.is_none() {
                         self.pending_failure = Some(PendingFailure {
@@ -823,6 +850,10 @@ impl Waiter for RunTracker<'_> {
 
 fn origin_of(run: &JsonObject) -> Option<&str> {
     run.get("origin_run_id").and_then(Value::as_str)
+}
+
+fn run_type(run: &JsonObject) -> Option<&str> {
+    run.get("run_type").and_then(Value::as_str)
 }
 
 fn retry_attempt(run: &JsonObject) -> i64 {
