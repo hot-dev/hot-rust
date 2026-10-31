@@ -48,8 +48,8 @@ mod transport;
 pub use client::{HotClient, HotClientBuilder};
 pub use error::{ApiError, Error, KeyScope};
 pub use resources::{
-    ApiKeysResource, BuildUpload, BuildsResource, CallOptions, ContextResource, DomainsResource,
-    EnvResource, EventsResource, FilesResource, OrgEnv, OrgResource, OrgsResource,
+    ApiKeysResource, BlobsResource, BuildUpload, BuildsResource, CallOptions, ContextResource,
+    DomainsResource, EnvResource, EventsResource, FilesResource, OrgEnv, OrgResource, OrgsResource,
     ProjectsResource, RunWaitOptions, RunsResource, ServiceKeysResource, SessionsResource,
     StreamsResource, SubscribeWithEventOptions, TaskWaitOptions, TasksResource, WaitOptions,
 };

@@ -39,8 +39,8 @@ src/
   transport.rs    — auth header, JSON request/response, error mapping
   errors.rs
   sse.rs          — SSE line/event parser
-  resources/      — builds, context, domains, env, events, files, org, projects,
-                    runs, service_keys, sessions, streams (12 namespaces, ~59 operations)
+  resources/      — blobs, builds, context, domains, env, events, files, org, projects,
+                    runs, service_keys, sessions, streams (13 namespaces, ~60 operations)
   streaming.rs    — StreamEvent enum, subscribe/subscribe_with_event returning
                     impl Stream<Item = Result<StreamEvent, HotError>>, wait_for_run_result
 ```

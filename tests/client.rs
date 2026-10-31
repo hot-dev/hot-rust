@@ -367,6 +367,57 @@ async fn path_segments_are_escaped() {
 }
 
 #[tokio::test]
+async fn blob_download_returns_the_raw_bytes() {
+    let server = MockServer::start().await;
+    let bytes: Vec<u8> = vec![0, 159, 146, 150, 255, 10, 13];
+    Mock::given(method("GET"))
+        .and(path("/v1/blobs/blob_123/download"))
+        .and(header("authorization", "Bearer env-token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(bytes.clone(), "application/octet-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = HotClient::builder("env-token")
+        .base_url(server.uri())
+        .build();
+    let response = client.blobs().download("blob_123").await.unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/octet-stream"
+    );
+    assert_eq!(response.bytes().await.unwrap().to_vec(), bytes);
+}
+
+#[tokio::test]
+async fn blob_download_escapes_the_id_and_maps_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/blobs/a%2Fb%20c/download"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": "not_found", "message": "Blob not found" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = HotClient::builder("env-token")
+        .base_url(server.uri())
+        .build();
+    let error = client.blobs().download("a/b c").await.unwrap_err();
+
+    let Error::Api(api_error) = error else {
+        panic!("expected Error::Api, got {error:?}");
+    };
+    assert_eq!(api_error.status_code, 404);
+    assert_eq!(api_error.code.as_deref(), Some("not_found"));
+}
+
+#[tokio::test]
 async fn idempotent_requests_retry_unavailable_responses() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

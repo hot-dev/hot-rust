@@ -165,6 +165,11 @@ resource!(
     /// Uploads, downloads, lists, and deletes files.
     FilesResource
 );
+resource!(
+    /// Downloads large payloads that Hot spilled to blob storage. Requires an
+    /// environment API key.
+    BlobsResource
+);
 // Resources an org API key can also reach inside one environment, through
 // `/v1/orgs/{org_id}/envs/{env_id}` (see [`OrgsResource::env`]).
 macro_rules! scoped_resource {
@@ -729,6 +734,18 @@ impl FilesResource {
             .request_json(Method::DELETE, &path, None, &[])
             .await?;
         Ok(())
+    }
+}
+
+impl BlobsResource {
+    /// Returns the raw HTTP response streaming the blob's bytes
+    /// (`application/octet-stream`; string payloads are UTF-8 text). The blob
+    /// must belong to the caller's environment, and the key needs `read` on
+    /// `blob:{blob_ref_id}`.
+    pub async fn download(&self, blob_ref_id: &str) -> Result<Response> {
+        let path = format!("/blobs/{}/download", enc(blob_ref_id));
+        let builder = self.transport.request_builder(Method::GET, &path);
+        self.transport.execute(builder).await
     }
 }
 

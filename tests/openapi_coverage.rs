@@ -38,11 +38,15 @@ fn coverage() -> BTreeMap<&'static str, &'static str> {
             "POST /v1/orgs/{org_id}/envs/{env_id}/api-keys",
             "orgs.create_env_api_key",
         ),
-        // The spec lists only this one of the forwarded environment routes;
+        // The spec lists only these two of the forwarded environment routes;
         // orgs.env(org, env) reaches every project, build, and context route.
         (
             "GET /v1/orgs/{org_id}/envs/{env_id}/projects",
             "orgs.env.projects.list",
+        ),
+        (
+            "GET /v1/orgs/{org_id}/envs/{env_id}/builds",
+            "orgs.env.builds.list",
         ),
         ("GET /v1/api-keys/{key_id}", "api_keys.get"),
         ("PATCH /v1/api-keys/{key_id}", "api_keys.update"),
@@ -172,6 +176,7 @@ fn coverage() -> BTreeMap<&'static str, &'static str> {
         ("GET /v1/files/{file_id}", "files.get"),
         ("DELETE /v1/files/{file_id}", "files.delete"),
         ("GET /v1/files/{file_id}/download", "files.download"),
+        ("GET /v1/blobs/{blob_ref_id}/download", "blobs.download"),
         ("PUT /v1/files/upload/{path}", "files.upload"),
         ("POST /v1/files/uploads", "files.initiate_upload"),
         (
@@ -211,6 +216,7 @@ async fn method_exists(client: hot_dev::HotClient) -> hot_dev::Result<()> {
     let _ = orgs.list_env_api_keys("o", "e", q).await?;
     let _ = orgs.create_env_api_key("o", "e", body.clone()).await?;
     let _ = orgs.env("o", "e").projects().list(q).await?;
+    let _ = orgs.env("o", "e").builds().list(q).await?;
     let _ = client.api_keys().get("k").await?;
     let _ = client.api_keys().update("k", body.clone()).await?;
     client.api_keys().revoke("k").await?;
@@ -317,6 +323,8 @@ async fn method_exists(client: hot_dev::HotClient) -> hot_dev::Result<()> {
     let _ = client.files().upload_part("u", 1, vec![]).await?;
     let _ = client.files().complete_upload("u").await?;
     client.files().abort_upload("u").await?;
+
+    let _ = client.blobs().download("b").await?;
 
     Ok(())
 }
