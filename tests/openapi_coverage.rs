@@ -19,6 +19,41 @@ use serde_json::Value;
 
 fn coverage() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
+        ("GET /v1/orgs", "orgs.list"),
+        ("POST /v1/orgs", "orgs.create"),
+        ("GET /v1/orgs/{org_id}", "orgs.get"),
+        ("PATCH /v1/orgs/{org_id}", "orgs.update"),
+        ("GET /v1/orgs/{org_id}/usage", "orgs.usage"),
+        ("DELETE /v1/orgs/{org_id}/calls", "orgs.purge_calls"),
+        ("GET /v1/orgs/{org_id}/envs", "orgs.list_envs"),
+        ("POST /v1/orgs/{org_id}/envs", "orgs.create_env"),
+        ("GET /v1/orgs/{org_id}/envs/{env_id}", "orgs.get_env"),
+        ("GET /v1/orgs/{org_id}/api-keys", "orgs.list_api_keys"),
+        ("POST /v1/orgs/{org_id}/api-keys", "orgs.create_api_key"),
+        (
+            "GET /v1/orgs/{org_id}/envs/{env_id}/api-keys",
+            "orgs.list_env_api_keys",
+        ),
+        (
+            "POST /v1/orgs/{org_id}/envs/{env_id}/api-keys",
+            "orgs.create_env_api_key",
+        ),
+        // The spec lists only this one of the forwarded environment routes;
+        // orgs.env(org, env) reaches every project, build, and context route.
+        (
+            "GET /v1/orgs/{org_id}/envs/{env_id}/projects",
+            "orgs.env.projects.list",
+        ),
+        ("GET /v1/api-keys/{key_id}", "api_keys.get"),
+        ("PATCH /v1/api-keys/{key_id}", "api_keys.update"),
+        ("DELETE /v1/api-keys/{key_id}", "api_keys.revoke"),
+        ("POST /v1/api-keys/{key_id}/rotate", "api_keys.rotate"),
+        ("DELETE /v1/env/calls", "env.purge_calls"),
+        ("DELETE /v1/runs/{run_id}/calls", "runs.purge_calls"),
+        (
+            "DELETE /v1/streams/{stream_id}/calls",
+            "streams.purge_calls",
+        ),
         // "" marks operations intentionally left out of the SDK.
         ("GET /status", ""), // public health endpoint
         ("GET /v1/projects", "projects.list"),
@@ -160,6 +195,29 @@ async fn method_exists(client: hot_dev::HotClient) -> hot_dev::Result<()> {
     };
     let body = serde_json::Map::new();
     let q: &[(&str, &str)] = &[];
+
+    let orgs = client.orgs();
+    let _ = orgs.list(q).await?;
+    let _ = orgs.create(body.clone()).await?;
+    let _ = orgs.get("o").await?;
+    let _ = orgs.update("o", body.clone()).await?;
+    let _ = orgs.usage("o").await?;
+    let _ = orgs.purge_calls("o", true).await?;
+    let _ = orgs.list_envs("o").await?;
+    let _ = orgs.create_env("o", body.clone()).await?;
+    let _ = orgs.get_env("o", "e").await?;
+    let _ = orgs.list_api_keys("o").await?;
+    let _ = orgs.create_api_key("o", body.clone()).await?;
+    let _ = orgs.list_env_api_keys("o", "e", q).await?;
+    let _ = orgs.create_env_api_key("o", "e", body.clone()).await?;
+    let _ = orgs.env("o", "e").projects().list(q).await?;
+    let _ = client.api_keys().get("k").await?;
+    let _ = client.api_keys().update("k", body.clone()).await?;
+    client.api_keys().revoke("k").await?;
+    let _ = client.api_keys().rotate("k", None).await?;
+    let _ = client.env().purge_calls().await?;
+    let _ = client.runs().purge_calls("r").await?;
+    let _ = client.streams().purge_calls("s").await?;
 
     let _ = client.projects().list(q).await?;
     let _ = client.projects().create(body.clone()).await?;

@@ -1,20 +1,28 @@
 use std::time::Duration;
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
-use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderValue, InvalidHeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
+};
 use reqwest::{Method, RequestBuilder, Response};
 use serde_json::Value;
 
-use crate::error::parse_api_error;
+use crate::error::{parse_api_error, ApiError};
+use crate::streaming::backoff;
 use crate::{Error, JsonObject, Result};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.hot.dev";
 
+/// Bounds each JSON request unless the builder sets its own timeout.
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
 const USER_AGENT_VALUE: &str = concat!("hot-sdk-rust/", env!("CARGO_PKG_VERSION"));
 
-// JSON requests retry on 429 when the server supplies retry_after.
+// JSON requests retry on 429 when the server supplies retry_after, and
+// idempotent ones also on 502, 503 and 504.
 const MAX_RETRIES: u32 = 2;
 const MAX_RETRY_AFTER_SECONDS: u64 = 30;
+const MAX_UNAVAILABLE_RETRY_AFTER_SECONDS: u64 = 10;
 
 // Mirrors Python's urllib quote(safe=""): everything but unreserved characters.
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
@@ -33,28 +41,43 @@ pub(crate) fn enc_path(path: &str) -> String {
     path.split('/').map(enc).collect::<Vec<_>>().join("/")
 }
 
+/// The Authorization header for a token. Surrounding whitespace, such as the
+/// newline a token file or secret store adds, is removed.
+pub(crate) fn authorization(token: &str) -> std::result::Result<HeaderValue, InvalidHeaderValue> {
+    let mut value = HeaderValue::try_from(format!("Bearer {}", token.trim()))?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+/// Maps a non-2xx response to an [`ApiError`]; `path` names the request.
+pub(crate) fn api_error(status: u16, text: &str, headers: &HeaderMap, path: &str) -> ApiError {
+    parse_api_error(status, text, headers).with_request_path(path)
+}
+
 pub(crate) struct Transport {
-    token: String,
+    // None when the token is not a valid header value: requests then fail
+    // before they are sent instead of going out without credentials.
+    authorization: Option<HeaderValue>,
     base_url: String,
     api_base_url: String,
     client: reqwest::Client,
-    timeout: Option<Duration>,
+    timeout: Duration,
 }
 
 impl Transport {
     pub(crate) fn new(
-        token: String,
+        authorization: Option<HeaderValue>,
         base_url: String,
         timeout: Option<Duration>,
         client: Option<reqwest::Client>,
     ) -> Transport {
         let base_url = base_url.trim_end_matches('/').to_string();
         Transport {
-            token,
+            authorization,
             api_base_url: format!("{base_url}/v1"),
             base_url,
             client: client.unwrap_or_default(),
-            timeout,
+            timeout: timeout.unwrap_or(DEFAULT_TIMEOUT),
         }
     }
 
@@ -64,13 +87,16 @@ impl Transport {
 
     /// Returns an authorized request builder for a path relative to /v1.
     pub(crate) fn request_builder(&self, method: Method, path: &str) -> RequestBuilder {
-        let mut auth = HeaderValue::try_from(format!("Bearer {}", self.token))
-            .unwrap_or(HeaderValue::from_static(""));
-        auth.set_sensitive(true);
-        self.client
+        let builder = self
+            .client
             .request(method, format!("{}{}", self.api_base_url, path))
-            .header(AUTHORIZATION, auth)
-            .header(USER_AGENT, USER_AGENT_VALUE)
+            .header(USER_AGENT, USER_AGENT_VALUE);
+        match &self.authorization {
+            Some(authorization) => builder.header(AUTHORIZATION, authorization.clone()),
+            // An invalid header value makes reqwest fail the request with a
+            // builder error when it is sent.
+            None => builder.header(AUTHORIZATION, "\n"),
+        }
     }
 
     /// Sends a request and maps non-2xx responses to [`ApiError`]. The
@@ -80,11 +106,13 @@ impl Transport {
         let status = response.status();
         if status.is_client_error() || status.is_server_error() {
             let headers = response.headers().clone();
+            let path = response.url().path().to_string();
             let text = response.text().await.unwrap_or_default();
-            return Err(Error::Api(parse_api_error(
+            return Err(Error::Api(api_error(
                 status.as_u16(),
                 &text,
                 &headers,
+                &path,
             )));
         }
         Ok(response)
@@ -100,14 +128,16 @@ impl Transport {
         body: Option<&Value>,
         query: &[(&str, &str)],
     ) -> Result<JsonObject> {
+        let idempotent = matches!(
+            method,
+            Method::GET | Method::HEAD | Method::PUT | Method::DELETE
+        );
         let mut attempts: u32 = 0;
         let response = loop {
             let mut builder = self
                 .request_builder(method.clone(), path)
-                .header(ACCEPT, "application/json");
-            if let Some(timeout) = self.timeout {
-                builder = builder.timeout(timeout);
-            }
+                .header(ACCEPT, "application/json")
+                .timeout(self.timeout);
             if !query.is_empty() {
                 builder = builder.query(query);
             }
@@ -120,17 +150,23 @@ impl Transport {
             if status.is_client_error() || status.is_server_error() {
                 let headers = response.headers().clone();
                 let text = response.text().await.unwrap_or_default();
-                let error = parse_api_error(status.as_u16(), &text, &headers);
-                if status.as_u16() == 429 && attempts < MAX_RETRIES {
-                    if let Some(retry_after) = error.retry_after {
-                        if retry_after > 0 {
-                            attempts += 1;
-                            tokio::time::sleep(Duration::from_secs(
-                                retry_after.min(MAX_RETRY_AFTER_SECONDS),
-                            ))
-                            .await;
-                            continue;
-                        }
+                let error = api_error(status.as_u16(), &text, &headers, path);
+                if attempts < MAX_RETRIES {
+                    let delay = match (status.as_u16(), error.retry_after) {
+                        (429, Some(retry_after)) if retry_after > 0 => Some(Duration::from_secs(
+                            retry_after.min(MAX_RETRY_AFTER_SECONDS),
+                        )),
+                        (502..=504, retry_after) if idempotent => Some(backoff(
+                            attempts + 1,
+                            retry_after
+                                .map(|seconds| seconds.min(MAX_UNAVAILABLE_RETRY_AFTER_SECONDS)),
+                        )),
+                        _ => None,
+                    };
+                    if let Some(delay) = delay {
+                        attempts += 1;
+                        tokio::time::sleep(delay).await;
+                        continue;
                     }
                 }
                 return Err(Error::Api(error));

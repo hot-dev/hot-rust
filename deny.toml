@@ -1,0 +1,10 @@
+# cargo deny check advisories (CI "Advisories" job): fail on RustSec
+# vulnerabilities, unmaintained or unsound crates, and yanked versions in
+# Cargo.lock. Add an `ignore` entry with a reason only when a fix is not
+# possible yet.
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = []

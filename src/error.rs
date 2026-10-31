@@ -115,3 +115,119 @@ fn retry_after(value: Option<&Value>, headers: &HeaderMap) -> Option<u64> {
         .and_then(|header| header.to_str().ok())
         .and_then(|header| header.parse().ok())
 }
+
+/// The kind of API key a route accepts. Org API keys call only `/v1/orgs`
+/// and `/v1/api-keys`; environment keys, sessions, and service keys call
+/// every other route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyScope {
+    /// An org API key.
+    Org,
+    /// An environment API key (or a session or service key it issued).
+    Env,
+}
+
+impl KeyScope {
+    /// The wire name: `"org"` or `"env"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyScope::Org => "org",
+            KeyScope::Env => "env",
+        }
+    }
+
+    /// The scope a request path needs; `path` may include the `/v1` prefix.
+    pub(crate) fn for_path(path: &str) -> KeyScope {
+        let path = path.find("/v1/").map_or(path, |index| &path[index + 3..]);
+        if path.starts_with("/orgs") || path.starts_with("/api-keys") {
+            KeyScope::Org
+        } else {
+            KeyScope::Env
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            KeyScope::Org => concat!(
+                "This call needs an org API key; environment keys, sessions ",
+                "and service keys call runtime routes"
+            ),
+            KeyScope::Env => concat!(
+                "This call needs an environment API key; org API keys only call ",
+                "/v1/orgs and /v1/api-keys"
+            ),
+        }
+    }
+}
+
+impl fmt::Display for KeyScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+const KEY_SCOPE_MISMATCH: &str = "key_scope_mismatch";
+
+impl ApiError {
+    /// For a `403 key_scope_mismatch` response, the kind of key the call
+    /// needs: the client's credential is the other kind.
+    pub fn required_scope(&self) -> Option<KeyScope> {
+        if self.code.as_deref() != Some(KEY_SCOPE_MISMATCH) {
+            return None;
+        }
+        if self.message.contains("needs an org API key") {
+            Some(KeyScope::Org)
+        } else if self.message.contains("needs an environment API key") {
+            Some(KeyScope::Env)
+        } else {
+            None
+        }
+    }
+
+    /// Names the needed key in `message` for a key-scope mismatch; the
+    /// server's own message stays in `error`.
+    pub(crate) fn with_request_path(mut self, path: &str) -> ApiError {
+        if self.code.as_deref() == Some(KEY_SCOPE_MISMATCH) {
+            self.message = KeyScope::for_path(path).message().to_string();
+        }
+        self
+    }
+}
+
+impl Error {
+    /// For a `403 key_scope_mismatch` API error, the kind of key the call
+    /// needs. See [`ApiError::required_scope`].
+    pub fn required_scope(&self) -> Option<KeyScope> {
+        match self {
+            Error::Api(error) => error.required_scope(),
+            _ => None,
+        }
+    }
+
+    /// Durable waiters stop on these instead of reconnecting: every 4xx except
+    /// 408 and 429, a request that could not be built, and run or task
+    /// outcomes. Transport failures, 408, 429, 5xx, and early stream ends are
+    /// transient.
+    pub(crate) fn is_permanent(&self) -> bool {
+        match self {
+            Error::Api(error) => {
+                (400..500).contains(&error.status_code) && !matches!(error.status_code, 408 | 429)
+            }
+            Error::Http(error) => error.is_builder(),
+            Error::Json(_) | Error::Protocol(_) => false,
+            Error::RunFailed(_)
+            | Error::RunWaitFailed { .. }
+            | Error::TaskFailed { .. }
+            | Error::Timeout
+            | Error::TaskTimeout => true,
+        }
+    }
+
+    /// The server's suggested retry delay in seconds, if any.
+    pub(crate) fn retry_after(&self) -> Option<u64> {
+        match self {
+            Error::Api(error) => error.retry_after,
+            _ => None,
+        }
+    }
+}
