@@ -205,7 +205,7 @@ scoped_resource!(
     ContextResource
 );
 resource!(
-    /// Provisions and manages child organizations, their environments, and
+    /// Provisions and manages sub-organizations, their environments, and
     /// API keys. Requires an org API key.
     OrgsResource
 );
@@ -1217,7 +1217,7 @@ impl OrgsResource {
         Ok(data_object(envelope))
     }
 
-    /// Returns the list envelope of the key's child organizations it may
+    /// Returns the list envelope of the key's sub-organizations it may
     /// read; pass `limit` (up to 500) and `offset`.
     pub async fn list(&self, query: &[(&str, &str)]) -> Result<JsonObject> {
         self.transport
@@ -1225,7 +1225,7 @@ impl OrgsResource {
             .await
     }
 
-    /// Provisions a child organization and its default environment. Returns
+    /// Provisions a sub-organization and its default environment. Returns
     /// `org`, `env_id`, and `created` (false when `idempotency_key` matched an
     /// earlier request; keep it stable across retries). Slugs have at most 32
     /// characters.
@@ -1245,7 +1245,7 @@ impl OrgsResource {
             .await
     }
 
-    /// Changes a child's lifecycle state (`{"state": "active" | "suspended" |
+    /// Changes a sub-organization's lifecycle state (`{"state": "active" | "suspended" |
     /// "archived"}`) and returns the organization.
     pub async fn update(&self, org_id: &str, body: impl Serialize) -> Result<JsonObject> {
         self.data(
@@ -1270,7 +1270,7 @@ impl OrgsResource {
     }
 
     /// Deletes every call trace in an organization's environments, and in
-    /// its children's when `include_sub_orgs` is true. Returns
+    /// its sub-organizations' when `include_sub_orgs` is true. Returns
     /// `calls_deleted`, `blob_refs_released`, and `complete`.
     pub async fn purge_calls(&self, org_id: &str, include_sub_orgs: bool) -> Result<JsonObject> {
         let query: &[(&str, &str)] = if include_sub_orgs {

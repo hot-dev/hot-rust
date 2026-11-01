@@ -169,7 +169,7 @@ downloads) are never retried; streaming helpers reconnect as described under
 - `client.service_keys()` — create and revoke scoped service keys
 - `client.org()` — view usage and limits
 - `client.env()` — read environment info, subscribe to environment events, and purge call traces
-- `client.orgs()` and `client.api_keys()` — child organizations, environments, and API keys, with an org API key (see [Org API keys](#org-api-keys))
+- `client.orgs()` and `client.api_keys()` — sub-organizations, environments, and API keys, with an org API key (see [Org API keys](#org-api-keys))
 
 List helpers return the first page of results (`data` plus `pagination` with
 `total`, `limit`, `offset`, and `has_more`). Methods that take a `query` accept
@@ -256,9 +256,9 @@ Apache-2.0
 
 ## Org API keys
 
-Requires Hot 3.0.1 or later. An org API key belongs to a root organization and
+Requires Hot 3.0.1 or later. An org API key belongs to a parent organization and
 calls only the control-plane routes: `client.orgs()` and `client.api_keys()`.
-It provisions child organizations and their environments and mints
+It provisions sub-organizations and their environments and mints
 environment API keys there. Runtime calls (events, streams, runs, and the rest)
 need an environment API key; use a separate `HotClient` per environment key. A
 call with the wrong kind of key returns `403 key_scope_mismatch`, and
@@ -270,12 +270,12 @@ use serde_json::json;
 # async fn example(org_key: &str) -> hot_dev::Result<()> {
 let org = HotClient::new(org_key);
 // Keep the idempotency key stable across retries. Slugs have at most 32 characters.
-let child = org.orgs().create(json!({
+let sub_org = org.orgs().create(json!({
     "name": "Customer", "slug": "customer-123",
     "idempotency_key": "customer-provisioning-123",
 })).await?;
-let org_id = child["org"]["org_id"].as_str().unwrap();
-let env_id = child["env_id"].as_str().unwrap();
+let org_id = sub_org["org"]["org_id"].as_str().unwrap();
+let env_id = sub_org["env_id"].as_str().unwrap();
 let key = org.orgs().create_env_api_key(org_id, env_id, json!({
     "description": "Customer backend",
     "permissions": {"event:*": ["create", "read"], "stream:*": ["read"]},
@@ -293,10 +293,10 @@ assert_eq!(error.required_scope(), Some(KeyScope::Env));
 
 | Method | Route |
 | --- | --- |
-| `orgs().list(query)` | `GET /v1/orgs` (children the key may read) |
+| `orgs().list(query)` | `GET /v1/orgs` (sub-organizations the key may read) |
 | `orgs().create(body)` | `POST /v1/orgs` (returns `org`, `env_id`, `created`) |
 | `orgs().get(org_id)` / `orgs().update(org_id, {"state": ...})` | `GET`/`PATCH /v1/orgs/{org_id}` (`active`, `suspended`, `archived`) |
-| `orgs().usage(root_org_id)` | `GET /v1/orgs/{org_id}/usage` (account usage; the root's ID) |
+| `orgs().usage(parent_org_id)` | `GET /v1/orgs/{org_id}/usage` (account usage; the parent organization's ID) |
 | `orgs().purge_calls(org_id, include_sub_orgs)` | `DELETE /v1/orgs/{org_id}/calls` |
 | `orgs().list_envs(org_id)` / `create_env` / `get_env` | `/v1/orgs/{org_id}/envs` |
 | `orgs().list_api_keys(org_id)` / `create_api_key` | `/v1/orgs/{org_id}/api-keys` (org keys) |
@@ -304,7 +304,7 @@ assert_eq!(error.required_scope(), Some(KeyScope::Env));
 | `api_keys().get` / `update` / `revoke` / `rotate(key_id, overlap_seconds)` | `/v1/api-keys/{key_id}` |
 | `orgs().env(org_id, env_id).projects()` / `.builds()` / `.context()` | projects, builds, deploys, and context in that environment |
 
-Grants use qualified resources such as `org:*` (children), `org:*/env:*`, and
+Grants use qualified resources such as `org:*` (sub-organizations), `org:*/env:*`, and
 `org:*/env:*/project:*`; a key can only mint keys within its own grants, and
 revoking or narrowing a key restricts everything it issued. See the server's
 [org API documentation](https://hot.dev/docs/api/management).
@@ -327,10 +327,10 @@ python3 integration/suborg_fixture.py --hot ../hot/target/debug/hot --backend po
 # For SQLite, use --backend sqlite.
 ```
 
-Coverage includes child and environment provisioning and idempotency,
+Coverage includes sub-organization and environment provisioning and idempotency,
 identical project names in siblings, foreign-ID and stream denial, parent
 runtime isolation, key-scope errors in both directions, key narrowing,
 rotation and revocation, project and context routes through an org key,
 paginated context lists, service and session issuance and revocation, issuer
-revocation and narrowing of existing descendants, and child suspension and
+revocation and narrowing of existing descendants, and sub-organization suspension and
 resumption.
