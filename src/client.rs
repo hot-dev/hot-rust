@@ -91,7 +91,7 @@ impl HotClient {
         OrgResource::new(self.transport.clone())
     }
 
-    /// Child organizations, their environments, and API keys. Requires an
+    /// Sub-organizations, their environments, and API keys. Requires an
     /// org API key.
     pub fn orgs(&self) -> OrgsResource {
         OrgsResource::new(self.transport.clone())
