@@ -217,10 +217,9 @@ impl Transport {
 
     /// Returns an authorized request builder for a path relative to /v1.
     pub(crate) fn request_builder(&self, method: Method, path: &str) -> RequestBuilder {
-        let normalized = normalize_api_path(path);
         let builder = self
             .client
-            .request(method, format!("{}{}", self.api_base_url, normalized))
+            .request(method, format!("{}{}", self.api_base_url, path))
             .header(USER_AGENT, USER_AGENT_VALUE);
         match &self.authorization {
             Some(authorization) => builder.header(AUTHORIZATION, authorization.clone()),

@@ -11,7 +11,7 @@ use crate::resources::{
     EventsResource, FilesResource, OrgResource, OrgsResource, ProjectsResource, RunsResource,
     ServiceKeysResource, SessionsResource, StreamsResource, TasksResource,
 };
-use crate::transport::{authorization, Transport, DEFAULT_BASE_URL};
+use crate::transport::{authorization, normalize_api_path, Transport, DEFAULT_BASE_URL};
 use crate::{JsonObject, Result};
 
 /// Hot API v1 client. Construct it with [`HotClient::builder`]; the resource
@@ -190,7 +190,8 @@ impl HotClient {
     /// for endpoints needing full control (raw bodies, custom headers).
     /// Send it with [`HotClient::execute`] to get API error mapping.
     pub fn request_builder(&self, method: Method, path: &str) -> RequestBuilder {
-        self.transport.request_builder(method, path)
+        let normalized = normalize_api_path(path);
+        self.transport.request_builder(method, &normalized)
     }
 
     /// Sends a request built with [`HotClient::request_builder`], mapping
