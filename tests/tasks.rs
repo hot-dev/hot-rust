@@ -50,3 +50,29 @@ async fn task_wait_returns_structured_failure() {
             if message == "boom" && task["status"] == "failed"
     ));
 }
+
+#[tokio::test]
+async fn task_wait_returns_structured_cancellation_and_timeout() {
+    for (status, reason) in [("cancelled", "stopped"), ("timed_out", "too slow")] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/tasks/t1/subscribe"))
+            .respond_with(task_event(status, reason))
+            .mount(&server)
+            .await;
+        let client = HotClient::builder("token").base_url(server.uri()).build();
+        let error = client
+            .tasks()
+            .wait("t1", TaskWaitOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                Error::TaskFailed { message, task }
+                    if message == reason && task["status"] == status
+            ),
+            "{status}: {error:?}"
+        );
+    }
+}

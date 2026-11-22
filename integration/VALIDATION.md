@@ -46,6 +46,5 @@ The `Org API isolation (PostgreSQL)` job builds the server revision pinned in
 to main. A weekly scheduled run builds hot `main` instead, to catch API drift
 early. When the API changes, update `integration/hot-server.ref` and the CI
 checkout SHA together, regenerate the OpenAPI fixture, and rerun the fixture.
-Keep the pin aligned across all five SDK repos. After hot v3.0.1 is tagged,
-pin to the tag's commit. The `Integration (hot dev)` job still tests the
-runtime API against the released Hot CLI.
+Keep the pin aligned across all five SDK repos. The `Integration (hot dev)` job
+still tests the runtime API against the released Hot CLI.

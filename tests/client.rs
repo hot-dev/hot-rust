@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
-use hot_dev::{CallOptions, Error, HotClient, KeyScope, SubscribeWithEventOptions};
+use hot_dev::{BuildUpload, CallOptions, Error, HotClient, KeyScope, SubscribeWithEventOptions};
 use serde_json::{json, Value};
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{body_json, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn envelope(data: Value) -> Value {
@@ -58,7 +58,7 @@ async fn list_methods_return_api_list_envelope() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": [{ "id": "run_123" }],
             "meta": { "request_id": "req_123" },
-            "pagination": { "page": 1, "per_page": 20, "total": 1, "total_pages": 1 },
+            "pagination": { "total": 1, "limit": 20, "offset": 0, "has_more": false },
         })))
         .expect(1)
         .mount(&server)
@@ -510,8 +510,16 @@ async fn invalid_tokens_are_rejected_before_sending() {
         .mount(&server)
         .await;
 
+    assert!(HotClient::builder("").try_build().is_err());
+    assert!(HotClient::builder("   \t\n").try_build().is_err());
     assert!(HotClient::builder("hot_one\nhot_two").try_build().is_err());
     assert!(HotClient::builder("hot_key\n").try_build().is_ok());
+
+    let empty_client = HotClient::builder("   ").base_url(server.uri()).build();
+    assert!(matches!(
+        empty_client.env().get().await.unwrap_err(),
+        Error::Http(error) if error.is_builder()
+    ));
 
     let client = HotClient::builder("hot_one\nhot_two")
         .base_url(server.uri())
@@ -712,6 +720,9 @@ async fn list_helpers_accept_pagination() {
     for route in [
         "/v1/projects/p1/context",
         "/v1/domains",
+        "/v1/events/e1/runs",
+        "/v1/orgs/o1/envs",
+        "/v1/orgs/o1/api-keys",
         "/v1/projects/p1/event-handlers",
         "/v1/projects/p1/schedules",
     ] {
@@ -732,6 +743,21 @@ async fn list_helpers_accept_pagination() {
     client.context().list_with_query("p1", page).await.unwrap();
     client.domains().list_with_query(page).await.unwrap();
     client
+        .events()
+        .get_runs_with_query("e1", page)
+        .await
+        .unwrap();
+    client
+        .orgs()
+        .list_envs_with_query("o1", page)
+        .await
+        .unwrap();
+    client
+        .orgs()
+        .list_api_keys_with_query("o1", page)
+        .await
+        .unwrap();
+    client
         .projects()
         .event_handlers_with_query("p1", page)
         .await
@@ -747,4 +773,475 @@ async fn list_helpers_accept_pagination() {
 fn reqwest_is_reexported_for_custom_http_clients() {
     let http = hot_dev::reqwest::Client::builder().build().unwrap();
     let _client = HotClient::builder("token").http_client(http).build();
+}
+
+#[tokio::test]
+async fn status_hits_unauthenticated_root_status_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .and(header(
+            "user-agent",
+            concat!("hot-sdk-rust/", env!("CARGO_PKG_VERSION")),
+        ))
+        .and(header("accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "ok",
+            "version": "3.0.14",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Even when configured with a trailing `/v1/`, status hits `{base_url}/status`.
+    let client = HotClient::builder("secret-token")
+        .base_url(format!("{}/v1/", server.uri()))
+        .build();
+    let status = client.status().await.unwrap();
+    assert_eq!(status["status"], "ok");
+    assert_eq!(status["version"], "3.0.14");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0].headers.contains_key("authorization"),
+        "GET /status must not send Authorization header"
+    );
+}
+
+#[tokio::test]
+async fn path_segment_validation_rejects_bad_segments_before_http() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = HotClient::builder("test-token")
+        .base_url(server.uri())
+        .build();
+    assert!(matches!(
+        client.sessions().revoke(".").await,
+        Err(Error::Protocol(_))
+    ));
+    assert!(matches!(
+        client.context().delete("p1", "..").await,
+        Err(Error::Protocol(_))
+    ));
+    assert!(matches!(
+        client.projects().get("").await,
+        Err(Error::Protocol(_))
+    ));
+    assert!(matches!(
+        client.files().upload("../x", b"abc".to_vec(), None).await,
+        Err(Error::Protocol(_))
+    ));
+    assert!(matches!(
+        client.orgs().env("..", "e1").projects().list(&[]).await,
+        Err(Error::Protocol(_))
+    ));
+}
+
+#[tokio::test]
+async fn redirects_are_not_followed_and_map_to_api_error() {
+    let server = MockServer::start().await;
+    for (verb, route) in [
+        ("GET", "/v1/projects/p1"),
+        ("GET", "/v1/blobs/b1/download"),
+        ("GET", "/v1/streams/s1/subscribe"),
+        ("GET", "/status"),
+    ] {
+        Mock::given(method(verb))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/redirected", server.uri()))
+                    .set_body_string("Found"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/redirected"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = HotClient::builder("test-token")
+        .base_url(server.uri())
+        .build();
+
+    assert!(matches!(
+        client.projects().get("p1").await,
+        Err(Error::Api(err)) if err.status_code == 302
+    ));
+    assert!(matches!(
+        client.blobs().download("b1").await,
+        Err(Error::Api(err)) if err.status_code == 302
+    ));
+    let mut stream = client.streams().subscribe("s1", None);
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(Error::Api(err))) if err.status_code == 302
+    ));
+    assert!(matches!(
+        client.status().await,
+        Err(Error::Api(err)) if err.status_code == 302
+    ));
+}
+
+#[tokio::test]
+async fn events_publish_supports_event_id_retries_503_in_progress_and_surfaces_409() {
+    let server = MockServer::start().await;
+    let payload = json!({
+        "event_id": "01950000-0000-7000-8000-000000000001",
+        "event_type": "app:order",
+        "event_data": { "order": 1 },
+    });
+
+    // 503 event_publish_in_progress on POST is retried automatically.
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .and(body_json(&payload))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("Retry-After", "1")
+                .set_body_json(json!({
+                    "error": {
+                        "code": "event_publish_in_progress",
+                        "message": "Event publish already in progress",
+                    }
+                })),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .and(body_json(&payload))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({
+            "event_id": "01950000-0000-7000-8000-000000000001",
+            "stream_id": "str_1",
+        }))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = HotClient::builder("test-token")
+        .base_url(server.uri())
+        .build();
+    let event = client.events().publish(&payload).await.unwrap();
+    assert_eq!(event["event_id"], "01950000-0000-7000-8000-000000000001");
+
+    // 409 event_id_conflict is returned immediately without retry.
+    let conflict_payload = json!({
+        "event_id": "01950000-0000-7000-8000-000000000001",
+        "event_type": "app:order",
+        "event_data": { "order": 2 },
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .and(body_json(&conflict_payload))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "error": {
+                "code": "event_id_conflict",
+                "message": "Event ID already used with different payload",
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = client
+        .events()
+        .publish(&conflict_payload)
+        .await
+        .unwrap_err();
+    let Error::Api(api_err) = error else {
+        panic!("expected ApiError, got {error:?}");
+    };
+    assert_eq!(api_err.status_code, 409);
+    assert_eq!(api_err.code.as_deref(), Some("event_id_conflict"));
+}
+
+#[tokio::test]
+async fn files_resource_contract_and_empty_204_upload() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/files"))
+        .and(query_param("limit", "10"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/files/f1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(envelope(json!({ "file_id": "f1" }))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/files/f1/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(b"hello".to_vec(), "text/plain"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/files/f1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v1/files/upload/docs/hello%20world.txt"))
+        .and(header("content-type", "text/plain"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(envelope(json!({ "path": "docs/hello world.txt" }))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Empty 204 body from upload decodes cleanly via decode_data_response.
+    Mock::given(method("PUT"))
+        .and(path("/v1/files/upload/empty.bin"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/files/uploads"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(envelope(json!({ "upload_id": "u1" }))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v1/files/uploads/u1/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({ "part": 1 }))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/files/uploads/u1/complete"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(envelope(json!({ "file_id": "f2" }))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/files/uploads/u1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = HotClient::builder("test-token")
+        .base_url(server.uri())
+        .build();
+    let files = client.files();
+    files.list(&[("limit", "10")]).await.unwrap();
+    assert_eq!(files.get("f1").await.unwrap()["file_id"], "f1");
+    let dl = files.download("f1").await.unwrap();
+    assert_eq!(dl.bytes().await.unwrap().as_ref(), b"hello");
+    files.delete("f1").await.unwrap();
+    assert_eq!(
+        files
+            .upload("/docs/hello world.txt", b"hi".to_vec(), Some("text/plain"))
+            .await
+            .unwrap()["path"],
+        "docs/hello world.txt"
+    );
+    assert!(files
+        .upload("empty.bin", vec![], None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        files
+            .initiate_upload(json!({ "path": "big.bin" }))
+            .await
+            .unwrap()["upload_id"],
+        "u1"
+    );
+    assert_eq!(
+        files.upload_part("u1", 1, b"part".to_vec()).await.unwrap()["part"],
+        1
+    );
+    assert_eq!(files.complete_upload("u1").await.unwrap()["file_id"], "f2");
+    files.abort_upload("u1").await.unwrap();
+}
+
+#[tokio::test]
+async fn builds_domains_sessions_service_keys_and_escape_hatch_contract() {
+    let server = MockServer::start().await;
+    for (verb, route) in [
+        ("GET", "/v1/builds"),
+        ("GET", "/v1/projects/p1/builds"),
+        ("GET", "/v1/projects/p1/builds/b1"),
+        ("GET", "/v1/projects/p1/builds/deployed"),
+        ("GET", "/v1/projects/p1/builds/live"),
+        ("POST", "/v1/projects/p1/builds/b1/deploy"),
+        ("POST", "/v1/domains"),
+        ("GET", "/v1/domains"),
+        ("GET", "/v1/domains/d1"),
+        ("DELETE", "/v1/domains/d1"),
+        ("POST", "/v1/domains/d1/verify"),
+        ("POST", "/v1/sessions"),
+        ("GET", "/v1/sessions"),
+        ("DELETE", "/v1/sessions/s1"),
+        ("DELETE", "/v1/sessions"),
+        ("POST", "/v1/service-keys"),
+        ("GET", "/v1/service-keys"),
+        ("GET", "/v1/service-keys/sk1"),
+        ("PATCH", "/v1/service-keys/sk1"),
+        ("DELETE", "/v1/service-keys/sk1"),
+        ("DELETE", "/v1/service-keys"),
+        ("GET", "/v1/custom-route"),
+    ] {
+        Mock::given(method(verb))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({ "ok": true }))))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/projects/p1/builds"))
+        .and(header_exists("content-type"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(envelope(json!({ "build_id": "b2" }))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/projects/p1/builds/b1/download"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(b"tarbytes".to_vec(), "application/octet-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/raw-check"))
+        .and(header("x-custom", "yes"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("raw-ok"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Also verifies base_url normalization with trailing `/v1/` and request() without leading `/`.
+    let client = HotClient::builder("test-token")
+        .base_url(format!("{}/v1/", server.uri()))
+        .build();
+
+    client.builds().list(&[]).await.unwrap();
+    client.builds().list_for_project("p1", &[]).await.unwrap();
+    client.builds().get("p1", "b1").await.unwrap();
+    client.builds().deployed("p1").await.unwrap();
+    client.builds().live("p1").await.unwrap();
+    let uploaded = client
+        .builds()
+        .upload(
+            "p1",
+            BuildUpload {
+                content: b"archive".to_vec(),
+                filename: Some("app.tar".to_string()),
+                hash: "sha256:abc".to_string(),
+                build_id: Some("b2".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded["build_id"], "b2");
+    let archive = client.builds().download("p1", "b1").await.unwrap();
+    assert_eq!(archive.bytes().await.unwrap().as_ref(), b"tarbytes");
+    client.builds().deploy("p1", "b1").await.unwrap();
+
+    client
+        .domains()
+        .create(json!({ "domain": "app.example" }))
+        .await
+        .unwrap();
+    client.domains().list().await.unwrap();
+    client.domains().get("d1").await.unwrap();
+    client.domains().delete("d1").await.unwrap();
+    client.domains().verify("d1").await.unwrap();
+
+    client.sessions().create(json!({})).await.unwrap();
+    client.sessions().list(&[]).await.unwrap();
+    client.sessions().revoke("s1").await.unwrap();
+    client.sessions().revoke_all().await.unwrap();
+
+    client.service_keys().create(json!({})).await.unwrap();
+    client.service_keys().list(&[]).await.unwrap();
+    client.service_keys().get("sk1").await.unwrap();
+    client
+        .service_keys()
+        .update("sk1", json!({}))
+        .await
+        .unwrap();
+    client.service_keys().revoke("sk1").await.unwrap();
+    client.service_keys().revoke_all().await.unwrap();
+
+    // Escape hatch without leading `/` works cleanly.
+    client
+        .request(hot_dev::reqwest::Method::GET, "custom-route", None, &[])
+        .await
+        .unwrap();
+
+    let builder = client
+        .request_builder(hot_dev::reqwest::Method::GET, "raw-check")
+        .header("x-custom", "yes");
+    let raw = client.execute(builder).await.unwrap();
+    assert_eq!(raw.text().await.unwrap(), "raw-ok");
+}
+
+#[tokio::test]
+async fn streams_handle_crlf_multibyte_and_invalid_utf8_over_http() {
+    let server = MockServer::start().await;
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"\xEF\xBB\xBFdata: {\"type\":\"a\",\"text\":\"\xE2\x82\xAC");
+    raw.push(0xFF);
+    raw.extend_from_slice(b"\"}\r\n\r\ndata: {\"type\":\"b\"}\r\n\r\n");
+
+    Mock::given(method("GET"))
+        .and(path("/v1/streams/s1/subscribe"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(raw, "text/event-stream"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = HotClient::builder("test-token")
+        .base_url(server.uri())
+        .build();
+    let mut stream = client.streams().subscribe("s1", None);
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["type"], "a");
+    assert_eq!(events[0]["text"], "€\u{FFFD}");
+    assert_eq!(events[1]["type"], "b");
 }

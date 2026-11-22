@@ -50,3 +50,48 @@ async fn run_wait_returns_structured_failure() {
             if message == "boom" && run["status"] == "failed"
     ));
 }
+
+#[tokio::test]
+async fn run_wait_returns_structured_cancellation() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/runs/r1/subscribe"))
+        .respond_with(run_event("cancelled", "aborted"))
+        .mount(&server)
+        .await;
+    let client = HotClient::builder("token").base_url(server.uri()).build();
+    let error = client
+        .runs()
+        .wait("r1", RunWaitOptions::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::RunWaitFailed { message, run }
+            if message == "aborted" && run["status"] == "cancelled"
+    ));
+}
+
+#[tokio::test]
+async fn run_wait_accepts_duration_max_without_panicking() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/runs/r1/subscribe"))
+        .respond_with(run_event("succeeded", "ok"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = HotClient::builder("token").base_url(server.uri()).build();
+    let run = client
+        .runs()
+        .wait(
+            "r1",
+            RunWaitOptions {
+                timeout: std::time::Duration::MAX,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(run["status"], "succeeded");
+}

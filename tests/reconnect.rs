@@ -534,3 +534,49 @@ async fn connections_without_events_count_as_failures() {
     assert!(matches!(error, Error::Protocol(_)), "{error:?}");
     assert_eq!(get_requests(&server).await, 2);
 }
+
+#[tokio::test]
+async fn redirects_stop_every_waiter_after_one_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/streams/subscribe-with-event"))
+        .respond_with(sse_response(&[PUBLISHED]))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("Location", "http://example.invalid"),
+        )
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+
+    let mut events = client
+        .streams()
+        .subscribe_with_event(json!({}), SubscribeWithEventOptions::default());
+    events.next().await.unwrap().unwrap();
+    let error = events.next().await.unwrap();
+    assert!(is_status(&error, 302), "{error:?}");
+    assert!(is_status(
+        &client
+            .tasks()
+            .wait("t", hot_dev::TaskWaitOptions::default())
+            .await,
+        302
+    ));
+    assert!(is_status(
+        &client
+            .runs()
+            .wait("r", hot_dev::RunWaitOptions::default())
+            .await,
+        302
+    ));
+    assert!(is_status(
+        &client
+            .streams()
+            .wait_for_run_result("s1", "e1", hot_dev::WaitOptions::default())
+            .await,
+        302
+    ));
+    assert_eq!(get_requests(&server).await, 4);
+}

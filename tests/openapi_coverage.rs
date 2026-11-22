@@ -58,8 +58,7 @@ fn coverage() -> BTreeMap<&'static str, &'static str> {
             "DELETE /v1/streams/{stream_id}/calls",
             "streams.purge_calls",
         ),
-        // "" marks operations intentionally left out of the SDK.
-        ("GET /status", ""), // public health endpoint
+        ("GET /status", "status"),
         ("GET /v1/projects", "projects.list"),
         ("POST /v1/projects", "projects.create"),
         ("GET /v1/projects/{project_id_or_slug}", "projects.get"),
@@ -201,6 +200,8 @@ async fn method_exists(client: hot_dev::HotClient) -> hot_dev::Result<()> {
     let body = serde_json::Map::new();
     let q: &[(&str, &str)] = &[];
 
+    let _ = client.status().await?;
+
     let orgs = client.orgs();
     let _ = orgs.list(q).await?;
     let _ = orgs.create(body.clone()).await?;
@@ -209,9 +210,11 @@ async fn method_exists(client: hot_dev::HotClient) -> hot_dev::Result<()> {
     let _ = orgs.usage("o").await?;
     let _ = orgs.purge_calls("o", true).await?;
     let _ = orgs.list_envs("o").await?;
+    let _ = orgs.list_envs_with_query("o", q).await?;
     let _ = orgs.create_env("o", body.clone()).await?;
     let _ = orgs.get_env("o", "e").await?;
     let _ = orgs.list_api_keys("o").await?;
+    let _ = orgs.list_api_keys_with_query("o", q).await?;
     let _ = orgs.create_api_key("o", body.clone()).await?;
     let _ = orgs.list_env_api_keys("o", "e", q).await?;
     let _ = orgs.create_env_api_key("o", "e", body.clone()).await?;
@@ -272,6 +275,7 @@ async fn method_exists(client: hot_dev::HotClient) -> hot_dev::Result<()> {
     let _ = client.events().list(q).await?;
     let _ = client.events().get("e").await?;
     let _ = client.events().get_runs("e").await?;
+    let _ = client.events().get_runs_with_query("e", q).await?;
 
     let _ = client.sessions().create(body.clone()).await?;
     let _ = client.sessions().list(q).await?;
@@ -343,10 +347,16 @@ fn openapi_operations_have_sdk_coverage_or_explicit_ignore() {
             )
         })
         .collect();
-    let coverage_keys: BTreeSet<String> = coverage().keys().map(|key| key.to_string()).collect();
+    let map = coverage();
+    let coverage_keys: BTreeSet<String> = map.keys().map(|key| key.to_string()).collect();
 
     let missing: Vec<_> = operation_keys.difference(&coverage_keys).collect();
     let stale: Vec<_> = coverage_keys.difference(&operation_keys).collect();
+    let uncovered: Vec<_> = map
+        .iter()
+        .filter(|(_, method)| method.is_empty())
+        .map(|(op, _)| *op)
+        .collect();
     assert!(
         missing.is_empty(),
         "operations without coverage: {missing:?}"
@@ -354,5 +364,9 @@ fn openapi_operations_have_sdk_coverage_or_explicit_ignore() {
     assert!(
         stale.is_empty(),
         "coverage for unknown operations: {stale:?}"
+    );
+    assert!(
+        uncovered.is_empty(),
+        "operations without SDK method mapping: {uncovered:?}"
     );
 }
