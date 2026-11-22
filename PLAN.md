@@ -12,7 +12,7 @@ resources, SSE streaming, errors) and follows the shared SDK conventions.
 - License: Apache-2.0
 - Versioning: lockstep with `@hot-dev/sdk` / `hot-dev` (PyPI), starting at the
   current shared version. Tags `v<version>`.
-- MSRV: pin (e.g. 1.78) and test it in CI; bumping MSRV is a minor release.
+- MSRV: pinned at 1.86 and tested in CI; bumping MSRV is a minor release.
 
 ## Tech choices
 
@@ -24,25 +24,24 @@ resources, SSE streaming, errors) and follows the shared SDK conventions.
   structs generated from the OpenAPI spec are a later release. The SDK never
   transforms user-owned payloads (`event_data`).
 - **SSE**: hand-rolled parser over the reqwest byte stream (both existing SDKs
-  hand-roll SSE; it's ~50–90 lines and avoids a dependency).
-- **Errors**: `thiserror`. `HotError` enum with `Api(HotApiError)` and
-  `Transport(...)` variants. `HotApiError` carries `status_code`, `code`,
+  hand-roll SSE; it avoids an extra dependency).
+- **Errors**: `thiserror`. `Error` enum with `Api(ApiError)` and
+  `Http(...)` variants. `ApiError` carries `status_code`, `code`,
   `request_id`, `retry_after` — same fields as the other SDKs.
 
 ## Architecture (mirror hot-python's file split)
 
 ```
 src/
-  lib.rs          — re-exports: HotClient, HotApiError, core types
+  lib.rs          — re-exports: HotClient, Error, ApiError, core types
   client.rs       — HotClient::builder(): token, base_url (default https://api.hot.dev),
-                    timeout, custom reqwest::Client; request()/request_raw() escape hatches
-  transport.rs    — auth header, JSON request/response, error mapping
-  errors.rs
-  sse.rs          — SSE line/event parser
-  resources/      — blobs, builds, context, domains, env, events, files, org, projects,
-                    runs, service_keys, sessions, streams (13 namespaces, ~60 operations)
-  streaming.rs    — StreamEvent enum, subscribe/subscribe_with_event returning
-                    impl Stream<Item = Result<StreamEvent, HotError>>, wait_for_run_result
+                    timeout, custom reqwest::Client; status(), request()/request_builder()/execute()
+  transport.rs    — auth header, path validation, JSON request/response, retries, error mapping
+  error.rs        — Error, ApiError, KeyScope
+  sse.rs          — streaming UTF-8 and WHATWG SSE block decoder
+  resources.rs    — blobs, builds, context, domains, env, events, files, org, orgs, api_keys,
+                    projects, runs, service_keys, sessions, streams, tasks (16 namespaces, 85 operations)
+  streaming.rs    — EventStream, StreamEventExt, Reconnect, RunTracker, durable wait helpers
 ```
 
 Behavioral contract to preserve:
@@ -70,10 +69,8 @@ Behavioral contract to preserve:
   mapping, retry-after) and streamed SSE bodies (reconnect behavior — mirror
   `test_reconnect.py` / `reconnect.test.ts` cases).
 - **OpenAPI coverage**: check in `tests/fixtures/openapi-operations.json`
-  (same 59-operation format as the other SDKs) plus a port of
-  `update-openapi-operations.mjs` (fetch `http://localhost:4681/openapi.json`
-  from a local `hot dev`). Coverage test asserts every operation maps to a
-  resource method.
+  (currently 85 operations from `http://localhost:4681/openapi.json`). Coverage
+  test asserts every operation maps to an SDK method.
 - **Live smoke test** (optional, `#[ignore]`-gated): run against a local
   `hot dev` server, same as manual verification for the other SDKs.
 - CI: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`,

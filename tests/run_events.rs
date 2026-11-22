@@ -382,3 +382,136 @@ async fn subscribe_with_event_is_not_ended_by_a_task_run() {
     }
     assert_eq!(last.unwrap().run_id(), Some("r1"));
 }
+
+#[tokio::test]
+async fn run_fail_retry_run_id_correlates_retry_without_origin_run_id() {
+    let fail_with_retry_id = r#"{"type":"run:fail","retry_run_id":"b","run":{"run_id":"a","event_id":"e1","status":"failed","retry_attempt":1,"result":"first attempt"}}"#;
+    let retry_no_origin = r#"{"type":"run:stop","run":{"run_id":"b","event_id":"e2","status":"succeeded","retry_attempt":1,"result":{"$ok":"via-retry-id"}}}"#;
+
+    let (_server, client) = server_with(
+        "/v1/streams/subscribe-with-event",
+        "POST",
+        &[
+            PUBLISHED,
+            r#"{"type":"stream:data","run_id":"b","payload":{"text":"chunk"}}"#,
+            fail_with_retry_id,
+            retry_no_origin,
+        ],
+    )
+    .await;
+    let mut chunks = Vec::new();
+    let mut on_chunk = |text: &str| chunks.push(text.to_string());
+    let result = client
+        .events()
+        .call_hot(
+            "f",
+            vec![],
+            CallOptions {
+                on_chunk: Some(&mut on_chunk),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, json!("via-retry-id"));
+    assert_eq!(chunks, ["chunk"]);
+
+    let (_server, client) = server_with(
+        "/v1/streams/subscribe-with-event",
+        "POST",
+        &[PUBLISHED, fail_with_retry_id, retry_no_origin],
+    )
+    .await;
+    let mut stream = client
+        .streams()
+        .subscribe_with_event(json!({}), SubscribeWithEventOptions::default());
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+    assert_eq!(events[1].retry_run_id(), Some("b"));
+    assert_eq!(events.last().unwrap().run_id(), Some("b"));
+}
+
+#[tokio::test]
+async fn subscribe_with_event_does_not_drop_final_failure_after_pending_retry() {
+    for (final_event, expected_type) in [
+        (
+            r#"{"type":"run:fail","run":{"run_id":"a","event_id":"e1","status":"failed","retry_attempt":0,"result":"final err"}}"#,
+            "run:fail",
+        ),
+        (
+            r#"{"type":"run:cancel","run":{"run_id":"a","event_id":"e1","status":"cancelled","retry_attempt":1,"result":"cancelled"}}"#,
+            "run:cancel",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/streams/subscribe-with-event"))
+            .respond_with(sse_response(&[PUBLISHED, PENDING_RETRY]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/streams/s1/subscribe"))
+            .respond_with(sse_response(&[final_event]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = HotClient::builder("test-token")
+            .base_url(server.uri())
+            .build();
+        let mut stream = client
+            .streams()
+            .subscribe_with_event(json!({}), SubscribeWithEventOptions::default());
+        let mut collected = Vec::new();
+        while let Some(event) = stream.next().await {
+            collected.push(event.unwrap());
+        }
+        assert_eq!(collected.len(), 3, "{collected:?}");
+        assert_eq!(collected[1].event_type(), "run:fail");
+        assert_eq!(collected[1].run().unwrap()["status"], "pending_retry");
+        assert_eq!(collected[2].event_type(), expected_type);
+        assert_eq!(collected[2].run_id(), Some("a"));
+    }
+}
+
+#[tokio::test]
+async fn subscribe_with_event_drains_reconnected_stream_even_after_grace_expires_during_backoff() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/streams/subscribe-with-event"))
+        .respond_with(sse_response(&[PUBLISHED, REPLAYED_FAILED]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Reconnect sleeps 6s (> 5s RETRY_GRACE) before the next GET delivers the retry.
+    Mock::given(method("GET"))
+        .and(path("/v1/streams/s1/subscribe"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "6"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/streams/s1/subscribe"))
+        .respond_with(sse_response(&[RETRY_STARTS, RETRY_SUCCEEDS]))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = HotClient::builder("test-token")
+        .base_url(server.uri())
+        .build();
+    let mut stream = client
+        .streams()
+        .subscribe_with_event(json!({}), SubscribeWithEventOptions::default());
+    let mut last = None;
+    while let Some(event) = stream.next().await {
+        last = Some(event.unwrap());
+    }
+    let last = last.expect("expected retry run:stop after reconnect");
+    assert_eq!(last.event_type(), "run:stop");
+    assert_eq!(last.run_id(), Some("b"));
+}

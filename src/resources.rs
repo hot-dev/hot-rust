@@ -1,7 +1,8 @@
 //! Resource namespaces mirroring the Hot API v1 resources. This module is a
 //! port of hot-python's resources.py.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,16 +12,54 @@ use reqwest::multipart::{Form, Part};
 use reqwest::{Method, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::time::Instant;
 
 use crate::streaming::{
     extract_run_result, iter_stream, open_stream, wait_for_call_result, wait_for_run,
     wait_for_run_result, wait_for_task, EventStream, Progress, Reconnect, RunTracker,
     StreamEventExt, IDLE_TIMEOUT,
 };
-use crate::transport::{data_object, decode_data_response, enc, enc_path, Transport};
+use crate::transport::{data_object, decode_data_response, enc_path, enc_segment, Transport};
 use crate::{Error, JsonObject, Result};
 
+/// Maximum run IDs retained in dedup sets per `subscribe_with_event` stream.
+const MAX_SEEN_RUN_IDS: usize = 4096;
+
+/// Grace window to drain a freshly reconnected stream when a pending failure's
+/// retry grace elapsed during reconnect backoff.
+const RECONNECT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+struct BoundedSet {
+    max_entries: usize,
+    entries: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl BoundedSet {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            entries: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, value: String) -> bool {
+        if !self.entries.insert(value.clone()) {
+            return false;
+        }
+        self.order.push_back(value);
+        if self.order.len() > self.max_entries {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
 /// Optional parameters for [`StreamsResource::subscribe_with_event`].
+#[derive(Debug, Clone)]
 pub struct SubscribeWithEventOptions {
     /// Scopes the subscription to a project id or slug.
     pub project: Option<String>,
@@ -50,6 +89,15 @@ pub struct WaitOptions<'a> {
     pub on_chunk: Option<&'a mut (dyn FnMut(&str) + Send)>,
 }
 
+impl fmt::Debug for WaitOptions<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WaitOptions")
+            .field("timeout", &self.timeout)
+            .field("on_chunk", &self.on_chunk.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
+}
+
 impl Default for WaitOptions<'_> {
     fn default() -> Self {
         WaitOptions {
@@ -60,6 +108,7 @@ impl Default for WaitOptions<'_> {
 }
 
 /// Optional parameters for [`TasksResource::wait`].
+#[derive(Debug, Clone)]
 pub struct TaskWaitOptions {
     /// Bounds the wait, including reconnects and their backoff.
     pub timeout: Duration,
@@ -68,6 +117,7 @@ pub struct TaskWaitOptions {
 }
 
 /// Optional parameters for [`RunsResource::wait`].
+#[derive(Debug, Clone)]
 pub struct RunWaitOptions {
     /// Bounds the wait, including reconnects and their backoff.
     pub timeout: Duration,
@@ -101,6 +151,15 @@ pub struct CallOptions<'a> {
     pub on_chunk: Option<&'a mut (dyn FnMut(&str) + Send)>,
 }
 
+impl fmt::Debug for CallOptions<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallOptions")
+            .field("timeout", &self.timeout)
+            .field("on_chunk", &self.on_chunk.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
+}
+
 impl Default for CallOptions<'_> {
     fn default() -> Self {
         CallOptions {
@@ -111,6 +170,7 @@ impl Default for CallOptions<'_> {
 }
 
 /// A build archive to upload.
+#[derive(Debug, Clone)]
 pub struct BuildUpload {
     /// The build archive content.
     pub content: Vec<u8>,
@@ -125,6 +185,7 @@ pub struct BuildUpload {
 macro_rules! resource {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
+        #[derive(Debug, Clone)]
         pub struct $name {
             transport: Arc<Transport>,
         }
@@ -175,18 +236,28 @@ resource!(
 macro_rules! scoped_resource {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
+        #[derive(Debug, Clone)]
         pub struct $name {
             transport: Arc<Transport>,
-            prefix: String,
+            prefix: std::result::Result<String, String>,
         }
 
         impl $name {
             pub(crate) fn new(transport: Arc<Transport>) -> Self {
-                Self::scoped(transport, String::new())
+                Self::scoped(transport, Ok(String::new()))
             }
 
-            pub(crate) fn scoped(transport: Arc<Transport>, prefix: String) -> Self {
+            pub(crate) fn scoped(
+                transport: Arc<Transport>,
+                prefix: std::result::Result<String, String>,
+            ) -> Self {
                 Self { transport, prefix }
+            }
+
+            fn prefix(&self) -> Result<&str> {
+                self.prefix
+                    .as_deref()
+                    .map_err(|message| Error::Protocol(message.clone()))
             }
         }
     };
@@ -272,7 +343,7 @@ impl EventsResource {
 
     /// Returns a single event.
     pub async fn get(&self, event_id: &str) -> Result<JsonObject> {
-        let path = format!("/events/{}", enc(event_id));
+        let path = format!("/events/{}", enc_segment(event_id)?);
         let envelope = self
             .transport
             .request_json(Method::GET, &path, None, &[])
@@ -280,11 +351,22 @@ impl EventsResource {
         Ok(data_object(envelope))
     }
 
-    /// Returns the runs triggered by an event.
+    /// Returns the first page of runs triggered by an event (list envelope).
+    /// Use [`EventsResource::get_runs_with_query`] to page.
     pub async fn get_runs(&self, event_id: &str) -> Result<JsonObject> {
-        let path = format!("/events/{}/runs", enc(event_id));
+        self.get_runs_with_query(event_id, &[]).await
+    }
+
+    /// Returns one page of runs triggered by an event; pass `limit` (up to
+    /// 500) and `offset`.
+    pub async fn get_runs_with_query(
+        &self,
+        event_id: &str,
+        query: &[(&str, &str)],
+    ) -> Result<JsonObject> {
+        let path = format!("/events/{}/runs", enc_segment(event_id)?);
         self.transport
-            .request_json(Method::GET, &path, None, &[])
+            .request_json(Method::GET, &path, None, query)
             .await
     }
 }
@@ -308,7 +390,7 @@ impl RunsResource {
 
     /// Returns a single run.
     pub async fn get(&self, run_id: &str) -> Result<JsonObject> {
-        let path = format!("/runs/{}", enc(run_id));
+        let path = format!("/runs/{}", enc_segment(run_id)?);
         let envelope = self
             .transport
             .request_json(Method::GET, &path, None, &[])
@@ -320,27 +402,21 @@ impl RunsResource {
     /// `blob_refs_released`, and `complete` (false when the server stopped at
     /// its time limit; call again).
     pub async fn purge_calls(&self, run_id: &str) -> Result<JsonObject> {
+        let path = format!("/runs/{}/calls", enc_segment(run_id)?);
         let envelope = self
             .transport
-            .request_json(
-                Method::DELETE,
-                &format!("/runs/{}/calls", enc(run_id)),
-                None,
-                &[],
-            )
+            .request_json(Method::DELETE, &path, None, &[])
             .await?;
         Ok(data_object(envelope))
     }
 
     /// Streams durable run:update snapshots until the run is terminal.
     pub fn subscribe(&self, run_id: &str) -> EventStream {
-        iter_stream(
-            self.transport.clone(),
-            Method::GET,
-            format!("/runs/{}/subscribe", enc(run_id)),
-            None,
-            Vec::new(),
-        )
+        let path = match enc_segment(run_id) {
+            Ok(id) => format!("/runs/{id}/subscribe"),
+            Err(error) => return error_stream(error),
+        };
+        iter_stream(self.transport.clone(), Method::GET, path, None, Vec::new())
     }
 
     /// Waits for successful run completion. Failed and cancelled runs return
@@ -406,24 +482,24 @@ impl StreamsResource {
     /// `blob_refs_released`, and `complete` (false when the server stopped at
     /// its time limit; call again).
     pub async fn purge_calls(&self, stream_id: &str) -> Result<JsonObject> {
+        let path = format!("/streams/{}/calls", enc_segment(stream_id)?);
         let envelope = self
             .transport
-            .request_json(
-                Method::DELETE,
-                &format!("/streams/{}/calls", enc(stream_id)),
-                None,
-                &[],
-            )
+            .request_json(Method::DELETE, &path, None, &[])
             .await?;
         Ok(data_object(envelope))
     }
 
     /// Streams events from an existing run stream.
     pub fn subscribe(&self, stream_id: &str, project: Option<&str>) -> EventStream {
+        let path = match enc_segment(stream_id) {
+            Ok(id) => format!("/streams/{id}/subscribe"),
+            Err(error) => return error_stream(error),
+        };
         iter_stream(
             self.transport.clone(),
             Method::GET,
-            format!("/streams/{}/subscribe", enc(stream_id)),
+            path,
             None,
             project_query(project),
         )
@@ -431,10 +507,14 @@ impl StreamsResource {
 
     /// Streams events from an existing run stream via POST.
     pub fn subscribe_post(&self, stream_id: &str, project: Option<&str>) -> EventStream {
+        let path = match enc_segment(stream_id) {
+            Ok(id) => format!("/streams/{id}/subscribe"),
+            Err(error) => return error_stream(error),
+        };
         iter_stream(
             self.transport.clone(),
             Method::POST,
-            format!("/streams/{}/subscribe", enc(stream_id)),
+            path,
             None,
             project_query(project),
         )
@@ -478,9 +558,7 @@ impl StreamsResource {
     ) -> EventStream {
         let body = match serde_json::to_value(body) {
             Ok(body) => body,
-            Err(error) => {
-                return Box::pin(async_stream::stream! { yield Err(Error::Json(error)) });
-            }
+            Err(error) => return error_stream(Error::Json(error)),
         };
         let transport = self.transport.clone();
         let query = project_query(opts.project.as_deref());
@@ -496,8 +574,8 @@ impl StreamsResource {
         }
 
         Box::pin(async_stream::stream! {
-            let mut seen_start: HashSet<String> = HashSet::new();
-            let mut seen_terminal: HashSet<String> = HashSet::new();
+            let mut seen_start = BoundedSet::new(MAX_SEEN_RUN_IDS);
+            let mut seen_terminal = BoundedSet::new(MAX_SEEN_RUN_IDS);
             let mut tracker = RunTracker::new(None, None);
             let mut stream_id: Option<String> = None;
             let mut reconnect = Reconnect::new(opts.max_attempts, None);
@@ -512,20 +590,44 @@ impl StreamsResource {
                         query.clone(),
                         Some(IDLE_TIMEOUT),
                     ),
-                    Some(id) => open_stream(
-                        transport.clone(),
-                        Method::GET,
-                        format!("/streams/{}/subscribe", enc(id)),
-                        None,
-                        query.clone(),
-                        Some(IDLE_TIMEOUT),
-                    ),
+                    Some(id) => {
+                        let encoded = match enc_segment(id) {
+                            Ok(encoded) => encoded,
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
+                        };
+                        open_stream(
+                            transport.clone(),
+                            Method::GET,
+                            format!("/streams/{encoded}/subscribe"),
+                            None,
+                            query.clone(),
+                            Some(IDLE_TIMEOUT),
+                        )
+                    }
                 };
+
+                // If a pending failure's grace timer expired while we were
+                // sleeping during reconnect backoff, still give this fresh
+                // connection a brief window to deliver any replayed retry run.
+                let mut drain_until = tracker
+                    .wake_at()
+                    .filter(|until| *until <= Instant::now())
+                    .and_then(|_| Instant::now().checked_add(RECONNECT_DRAIN_GRACE));
 
                 let mut progress = Progress::Nothing;
                 let mut ended_with = None;
                 loop {
-                    let next = match tracker.wake_at() {
+                    let wake_until = match tracker.wake_at() {
+                        Some(until) => Some(drain_until.map_or(until, |drain| until.max(drain))),
+                        None => {
+                            drain_until = None;
+                            None
+                        }
+                    };
+                    let next = match wake_until {
                         // A failure is waiting for its retry; when none comes,
                         // the failure (already yielded) ends the stream.
                         Some(until) => match tokio::time::timeout_at(until, source.next()).await {
@@ -549,10 +651,19 @@ impl StreamsResource {
                             .and_then(Value::as_str)
                             .map(str::to_string);
                     }
+                    let is_pending_retry = event
+                        .run()
+                        .and_then(|run| run.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("pending_retry");
                     let duplicate = match (event.event_type(), event.run_id()) {
                         ("run:start", Some(run_id)) => !seen_start.insert(run_id.to_string()),
                         ("run:stop" | "run:fail" | "run:cancel", Some(run_id)) => {
-                            !seen_terminal.insert(run_id.to_string())
+                            if is_pending_retry {
+                                false
+                            } else {
+                                !seen_terminal.insert(run_id.to_string())
+                            }
                         }
                         _ => false,
                     };
@@ -568,6 +679,14 @@ impl StreamsResource {
                     if terminal {
                         return;
                     }
+                }
+
+                // We drained the reconnected stream cleanly and the pending
+                // failure's grace timer has already expired without a retry.
+                if ended_with.is_none()
+                    && tracker.wake_at().is_some_and(|until| Instant::now() >= until)
+                {
+                    return;
                 }
 
                 // Publishing again would duplicate the event, so only a
@@ -600,7 +719,7 @@ impl StreamsResource {
 impl TasksResource {
     /// Returns the latest durable task snapshot.
     pub async fn get(&self, task_id: &str) -> Result<JsonObject> {
-        let path = format!("/tasks/{}", enc(task_id));
+        let path = format!("/tasks/{}", enc_segment(task_id)?);
         let envelope = self
             .transport
             .request_json(Method::GET, &path, None, &[])
@@ -610,13 +729,11 @@ impl TasksResource {
 
     /// Streams durable task:update snapshots until the task is terminal.
     pub fn subscribe(&self, task_id: &str) -> EventStream {
-        iter_stream(
-            self.transport.clone(),
-            Method::GET,
-            format!("/tasks/{}/subscribe", enc(task_id)),
-            None,
-            Vec::new(),
-        )
+        let path = match enc_segment(task_id) {
+            Ok(id) => format!("/tasks/{id}/subscribe"),
+            Err(error) => return error_stream(error),
+        };
+        iter_stream(self.transport.clone(), Method::GET, path, None, Vec::new())
     }
 
     /// Waits for successful task completion. Failed, cancelled, and timed-out
@@ -642,7 +759,7 @@ impl FilesResource {
 
     /// Returns a single file's metadata.
     pub async fn get(&self, file_id: &str) -> Result<JsonObject> {
-        let path = format!("/files/{}", enc(file_id));
+        let path = format!("/files/{}", enc_segment(file_id)?);
         let envelope = self
             .transport
             .request_json(Method::GET, &path, None, &[])
@@ -652,7 +769,7 @@ impl FilesResource {
 
     /// Deletes a file.
     pub async fn delete(&self, file_id: &str) -> Result<()> {
-        let path = format!("/files/{}", enc(file_id));
+        let path = format!("/files/{}", enc_segment(file_id)?);
         self.transport
             .request_json(Method::DELETE, &path, None, &[])
             .await?;
@@ -661,7 +778,7 @@ impl FilesResource {
 
     /// Returns the raw HTTP response streaming the file content.
     pub async fn download(&self, file_id: &str) -> Result<Response> {
-        let path = format!("/files/{}/download", enc(file_id));
+        let path = format!("/files/{}/download", enc_segment(file_id)?);
         let builder = self.transport.request_builder(Method::GET, &path);
         self.transport.execute(builder).await
     }
@@ -673,7 +790,7 @@ impl FilesResource {
         content: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<JsonObject> {
-        let request_path = format!("/files/upload/{}", enc_path(path));
+        let request_path = format!("/files/upload/{}", enc_path(path)?);
         let mut builder = self
             .transport
             .request_builder(Method::PUT, &request_path)
@@ -707,7 +824,7 @@ impl FilesResource {
         part_number: u32,
         content: Vec<u8>,
     ) -> Result<JsonObject> {
-        let path = format!("/files/uploads/{}/{}", enc(upload_id), part_number);
+        let path = format!("/files/uploads/{}/{}", enc_segment(upload_id)?, part_number);
         let builder = self
             .transport
             .request_builder(Method::PUT, &path)
@@ -719,7 +836,7 @@ impl FilesResource {
 
     /// Finishes a multipart upload.
     pub async fn complete_upload(&self, upload_id: &str) -> Result<JsonObject> {
-        let path = format!("/files/uploads/{}/complete", enc(upload_id));
+        let path = format!("/files/uploads/{}/complete", enc_segment(upload_id)?);
         let envelope = self
             .transport
             .request_json(Method::POST, &path, None, &[])
@@ -729,7 +846,7 @@ impl FilesResource {
 
     /// Cancels a multipart upload.
     pub async fn abort_upload(&self, upload_id: &str) -> Result<()> {
-        let path = format!("/files/uploads/{}", enc(upload_id));
+        let path = format!("/files/uploads/{}", enc_segment(upload_id)?);
         self.transport
             .request_json(Method::DELETE, &path, None, &[])
             .await?;
@@ -743,7 +860,7 @@ impl BlobsResource {
     /// must belong to the caller's environment, and the key needs `read` on
     /// `blob:{blob_ref_id}`.
     pub async fn download(&self, blob_ref_id: &str) -> Result<Response> {
-        let path = format!("/blobs/{}/download", enc(blob_ref_id));
+        let path = format!("/blobs/{}/download", enc_segment(blob_ref_id)?);
         let builder = self.transport.request_builder(Method::GET, &path);
         self.transport.execute(builder).await
     }
@@ -752,23 +869,20 @@ impl BlobsResource {
 impl ProjectsResource {
     /// Returns the project list envelope (data + pagination).
     pub async fn list(&self, query: &[(&str, &str)]) -> Result<JsonObject> {
+        let prefix = self.prefix()?;
         self.transport
-            .request_json(
-                Method::GET,
-                &format!("{}/projects", self.prefix),
-                None,
-                query,
-            )
+            .request_json(Method::GET, &format!("{prefix}/projects"), None, query)
             .await
     }
 
     /// Creates a project.
     pub async fn create(&self, body: impl Serialize) -> Result<JsonObject> {
+        let prefix = self.prefix()?;
         let envelope = self
             .transport
             .request_json(
                 Method::POST,
-                &format!("{}/projects", self.prefix),
+                &format!("{prefix}/projects"),
                 Some(&serde_json::to_value(body)?),
                 &[],
             )
@@ -778,7 +892,7 @@ impl ProjectsResource {
 
     /// Returns a project by id or slug.
     pub async fn get(&self, project: &str) -> Result<JsonObject> {
-        let path = format!("{}/projects/{}", self.prefix, enc(project));
+        let path = format!("{}/projects/{}", self.prefix()?, enc_segment(project)?);
         let envelope = self
             .transport
             .request_json(Method::GET, &path, None, &[])
@@ -788,7 +902,7 @@ impl ProjectsResource {
 
     /// Patches a project.
     pub async fn update(&self, project: &str, body: impl Serialize) -> Result<JsonObject> {
-        let path = format!("{}/projects/{}", self.prefix, enc(project));
+        let path = format!("{}/projects/{}", self.prefix()?, enc_segment(project)?);
         let envelope = self
             .transport
             .request_json(
@@ -803,7 +917,7 @@ impl ProjectsResource {
 
     /// Deletes a project.
     pub async fn delete(&self, project: &str) -> Result<()> {
-        let path = format!("{}/projects/{}", self.prefix, enc(project));
+        let path = format!("{}/projects/{}", self.prefix()?, enc_segment(project)?);
         self.transport
             .request_json(Method::DELETE, &path, None, &[])
             .await?;
@@ -812,7 +926,11 @@ impl ProjectsResource {
 
     /// Activates a project.
     pub async fn activate(&self, project: &str) -> Result<JsonObject> {
-        let path = format!("{}/projects/{}/activate", self.prefix, enc(project));
+        let path = format!(
+            "{}/projects/{}/activate",
+            self.prefix()?,
+            enc_segment(project)?
+        );
         let envelope = self
             .transport
             .request_json(Method::POST, &path, None, &[])
@@ -822,7 +940,11 @@ impl ProjectsResource {
 
     /// Deactivates a project.
     pub async fn deactivate(&self, project: &str) -> Result<JsonObject> {
-        let path = format!("{}/projects/{}/deactivate", self.prefix, enc(project));
+        let path = format!(
+            "{}/projects/{}/deactivate",
+            self.prefix()?,
+            enc_segment(project)?
+        );
         let envelope = self
             .transport
             .request_json(Method::POST, &path, None, &[])
@@ -843,7 +965,11 @@ impl ProjectsResource {
         project: &str,
         query: &[(&str, &str)],
     ) -> Result<JsonObject> {
-        let path = format!("{}/projects/{}/event-handlers", self.prefix, enc(project));
+        let path = format!(
+            "{}/projects/{}/event-handlers",
+            self.prefix()?,
+            enc_segment(project)?
+        );
         self.transport
             .request_json(Method::GET, &path, None, query)
             .await
@@ -862,7 +988,11 @@ impl ProjectsResource {
         project: &str,
         query: &[(&str, &str)],
     ) -> Result<JsonObject> {
-        let path = format!("{}/projects/{}/schedules", self.prefix, enc(project));
+        let path = format!(
+            "{}/projects/{}/schedules",
+            self.prefix()?,
+            enc_segment(project)?
+        );
         self.transport
             .request_json(Method::GET, &path, None, query)
             .await
@@ -872,8 +1002,9 @@ impl ProjectsResource {
 impl BuildsResource {
     /// Returns the build list envelope across all projects.
     pub async fn list(&self, query: &[(&str, &str)]) -> Result<JsonObject> {
+        let prefix = self.prefix()?;
         self.transport
-            .request_json(Method::GET, &format!("{}/builds", self.prefix), None, query)
+            .request_json(Method::GET, &format!("{prefix}/builds"), None, query)
             .await
     }
 
@@ -883,7 +1014,11 @@ impl BuildsResource {
         project: &str,
         query: &[(&str, &str)],
     ) -> Result<JsonObject> {
-        let path = format!("{}/projects/{}/builds", self.prefix, enc(project));
+        let path = format!(
+            "{}/projects/{}/builds",
+            self.prefix()?,
+            enc_segment(project)?
+        );
         self.transport
             .request_json(Method::GET, &path, None, query)
             .await
@@ -893,9 +1028,9 @@ impl BuildsResource {
     pub async fn get(&self, project: &str, build_id: &str) -> Result<JsonObject> {
         let path = format!(
             "{}/projects/{}/builds/{}",
-            self.prefix,
-            enc(project),
-            enc(build_id)
+            self.prefix()?,
+            enc_segment(project)?,
+            enc_segment(build_id)?
         );
         let envelope = self
             .transport
@@ -906,7 +1041,11 @@ impl BuildsResource {
 
     /// Returns the project's deployed build.
     pub async fn deployed(&self, project: &str) -> Result<JsonObject> {
-        let path = format!("{}/projects/{}/builds/deployed", self.prefix, enc(project));
+        let path = format!(
+            "{}/projects/{}/builds/deployed",
+            self.prefix()?,
+            enc_segment(project)?
+        );
         let envelope = self
             .transport
             .request_json(Method::GET, &path, None, &[])
@@ -916,7 +1055,11 @@ impl BuildsResource {
 
     /// Returns the project's live build.
     pub async fn live(&self, project: &str) -> Result<JsonObject> {
-        let path = format!("{}/projects/{}/builds/live", self.prefix, enc(project));
+        let path = format!(
+            "{}/projects/{}/builds/live",
+            self.prefix()?,
+            enc_segment(project)?
+        );
         let envelope = self
             .transport
             .request_json(Method::GET, &path, None, &[])
@@ -926,6 +1069,11 @@ impl BuildsResource {
 
     /// Uploads a build archive as multipart form data.
     pub async fn upload(&self, project: &str, upload: BuildUpload) -> Result<JsonObject> {
+        let path = format!(
+            "{}/projects/{}/builds",
+            self.prefix()?,
+            enc_segment(project)?
+        );
         let mut form = Form::new().text("hash", upload.hash);
         if let Some(build_id) = upload.build_id {
             form = form.text("build_id", build_id);
@@ -934,7 +1082,6 @@ impl BuildsResource {
             .file_name(upload.filename.unwrap_or_else(|| "build".to_string()));
         form = form.part("file", part);
 
-        let path = format!("{}/projects/{}/builds", self.prefix, enc(project));
         let builder = self
             .transport
             .request_builder(Method::POST, &path)
@@ -948,9 +1095,9 @@ impl BuildsResource {
     pub async fn download(&self, project: &str, build_id: &str) -> Result<Response> {
         let path = format!(
             "{}/projects/{}/builds/{}/download",
-            self.prefix,
-            enc(project),
-            enc(build_id)
+            self.prefix()?,
+            enc_segment(project)?,
+            enc_segment(build_id)?
         );
         let builder = self.transport.request_builder(Method::GET, &path);
         self.transport.execute(builder).await
@@ -960,9 +1107,9 @@ impl BuildsResource {
     pub async fn deploy(&self, project: &str, build_id: &str) -> Result<JsonObject> {
         let path = format!(
             "{}/projects/{}/builds/{}/deploy",
-            self.prefix,
-            enc(project),
-            enc(build_id)
+            self.prefix()?,
+            enc_segment(project)?,
+            enc_segment(build_id)?
         );
         let envelope = self
             .transport
@@ -986,7 +1133,11 @@ impl ContextResource {
         project: &str,
         query: &[(&str, &str)],
     ) -> Result<JsonObject> {
-        let path = format!("{}/projects/{}/context", self.prefix, enc(project));
+        let path = format!(
+            "{}/projects/{}/context",
+            self.prefix()?,
+            enc_segment(project)?
+        );
         self.transport
             .request_json(Method::GET, &path, None, query)
             .await
@@ -994,7 +1145,11 @@ impl ContextResource {
 
     /// Creates a context variable.
     pub async fn create(&self, project: &str, body: impl Serialize) -> Result<JsonObject> {
-        let path = format!("{}/projects/{}/context", self.prefix, enc(project));
+        let path = format!(
+            "{}/projects/{}/context",
+            self.prefix()?,
+            enc_segment(project)?
+        );
         let envelope = self
             .transport
             .request_json(Method::POST, &path, Some(&serde_json::to_value(body)?), &[])
@@ -1011,9 +1166,9 @@ impl ContextResource {
     ) -> Result<JsonObject> {
         let path = format!(
             "{}/projects/{}/context/{}",
-            self.prefix,
-            enc(project),
-            enc(key)
+            self.prefix()?,
+            enc_segment(project)?,
+            enc_segment(key)?
         );
         let envelope = self
             .transport
@@ -1026,9 +1181,9 @@ impl ContextResource {
     pub async fn delete(&self, project: &str, key: &str) -> Result<()> {
         let path = format!(
             "{}/projects/{}/context/{}",
-            self.prefix,
-            enc(project),
-            enc(key)
+            self.prefix()?,
+            enc_segment(project)?,
+            enc_segment(key)?
         );
         self.transport
             .request_json(Method::DELETE, &path, None, &[])
@@ -1067,7 +1222,7 @@ impl DomainsResource {
 
     /// Returns a single domain.
     pub async fn get(&self, domain_id: &str) -> Result<JsonObject> {
-        let path = format!("/domains/{}", enc(domain_id));
+        let path = format!("/domains/{}", enc_segment(domain_id)?);
         let envelope = self
             .transport
             .request_json(Method::GET, &path, None, &[])
@@ -1077,7 +1232,7 @@ impl DomainsResource {
 
     /// Deletes a domain.
     pub async fn delete(&self, domain_id: &str) -> Result<()> {
-        let path = format!("/domains/{}", enc(domain_id));
+        let path = format!("/domains/{}", enc_segment(domain_id)?);
         self.transport
             .request_json(Method::DELETE, &path, None, &[])
             .await?;
@@ -1086,7 +1241,7 @@ impl DomainsResource {
 
     /// Triggers domain verification.
     pub async fn verify(&self, domain_id: &str) -> Result<JsonObject> {
-        let path = format!("/domains/{}/verify", enc(domain_id));
+        let path = format!("/domains/{}/verify", enc_segment(domain_id)?);
         let envelope = self
             .transport
             .request_json(Method::POST, &path, None, &[])
@@ -1119,7 +1274,7 @@ impl SessionsResource {
 
     /// Revokes one session.
     pub async fn revoke(&self, session_id: &str) -> Result<()> {
-        let path = format!("/sessions/{}", enc(session_id));
+        let path = format!("/sessions/{}", enc_segment(session_id)?);
         self.transport
             .request_json(Method::DELETE, &path, None, &[])
             .await?;
@@ -1160,7 +1315,7 @@ impl ServiceKeysResource {
 
     /// Returns a single service key.
     pub async fn get(&self, service_key_id: &str) -> Result<JsonObject> {
-        let path = format!("/service-keys/{}", enc(service_key_id));
+        let path = format!("/service-keys/{}", enc_segment(service_key_id)?);
         let envelope = self
             .transport
             .request_json(Method::GET, &path, None, &[])
@@ -1170,7 +1325,7 @@ impl ServiceKeysResource {
 
     /// Patches a service key.
     pub async fn update(&self, service_key_id: &str, body: impl Serialize) -> Result<JsonObject> {
-        let path = format!("/service-keys/{}", enc(service_key_id));
+        let path = format!("/service-keys/{}", enc_segment(service_key_id)?);
         let envelope = self
             .transport
             .request_json(
@@ -1185,7 +1340,7 @@ impl ServiceKeysResource {
 
     /// Revokes one service key.
     pub async fn revoke(&self, service_key_id: &str) -> Result<()> {
-        let path = format!("/service-keys/{}", enc(service_key_id));
+        let path = format!("/service-keys/{}", enc_segment(service_key_id)?);
         self.transport
             .request_json(Method::DELETE, &path, None, &[])
             .await?;
@@ -1241,96 +1396,91 @@ impl OrgsResource {
 
     /// Returns one organization.
     pub async fn get(&self, org_id: &str) -> Result<JsonObject> {
-        self.data(Method::GET, &format!("/orgs/{}", enc(org_id)), None, &[])
-            .await
+        let path = format!("/orgs/{}", enc_segment(org_id)?);
+        self.data(Method::GET, &path, None, &[]).await
     }
 
     /// Changes a sub-organization's lifecycle state (`{"state": "active" | "suspended" |
     /// "archived"}`) and returns the organization.
     pub async fn update(&self, org_id: &str, body: impl Serialize) -> Result<JsonObject> {
-        self.data(
-            Method::PATCH,
-            &format!("/orgs/{}", enc(org_id)),
-            Some(serde_json::to_value(body)?),
-            &[],
-        )
-        .await
+        let path = format!("/orgs/{}", enc_segment(org_id)?);
+        self.data(Method::PATCH, &path, Some(serde_json::to_value(body)?), &[])
+            .await
     }
 
-    /// Returns account usage for the current billing period. Pass the root
+    /// Returns account usage for the current billing period. Pass the parent
     /// organization's ID (the org key's own organization).
     pub async fn usage(&self, org_id: &str) -> Result<JsonObject> {
-        self.data(
-            Method::GET,
-            &format!("/orgs/{}/usage", enc(org_id)),
-            None,
-            &[],
-        )
-        .await
+        let path = format!("/orgs/{}/usage", enc_segment(org_id)?);
+        self.data(Method::GET, &path, None, &[]).await
     }
 
     /// Deletes every call trace in an organization's environments, and in
     /// its sub-organizations' when `include_sub_orgs` is true. Returns
     /// `calls_deleted`, `blob_refs_released`, and `complete`.
     pub async fn purge_calls(&self, org_id: &str, include_sub_orgs: bool) -> Result<JsonObject> {
+        let path = format!("/orgs/{}/calls", enc_segment(org_id)?);
         let query: &[(&str, &str)] = if include_sub_orgs {
             &[("include_sub_orgs", "true")]
         } else {
             &[]
         };
-        self.data(
-            Method::DELETE,
-            &format!("/orgs/{}/calls", enc(org_id)),
-            None,
-            query,
-        )
-        .await
+        self.data(Method::DELETE, &path, None, query).await
     }
 
-    /// Returns the list envelope of an organization's environments.
+    /// Returns the first page of an organization's environments (list
+    /// envelope). Use [`OrgsResource::list_envs_with_query`] to page.
     pub async fn list_envs(&self, org_id: &str) -> Result<JsonObject> {
+        self.list_envs_with_query(org_id, &[]).await
+    }
+
+    /// Returns one page of an organization's environments; pass `limit` (up
+    /// to 500) and `offset`.
+    pub async fn list_envs_with_query(
+        &self,
+        org_id: &str,
+        query: &[(&str, &str)],
+    ) -> Result<JsonObject> {
+        let path = format!("/orgs/{}/envs", enc_segment(org_id)?);
         self.transport
-            .request_json(
-                Method::GET,
-                &format!("/orgs/{}/envs", enc(org_id)),
-                None,
-                &[],
-            )
+            .request_json(Method::GET, &path, None, query)
             .await
     }
 
     /// Creates an environment (`{"name": ...}`); idempotent by exact name.
     pub async fn create_env(&self, org_id: &str, body: impl Serialize) -> Result<JsonObject> {
-        self.data(
-            Method::POST,
-            &format!("/orgs/{}/envs", enc(org_id)),
-            Some(serde_json::to_value(body)?),
-            &[],
-        )
-        .await
+        let path = format!("/orgs/{}/envs", enc_segment(org_id)?);
+        self.data(Method::POST, &path, Some(serde_json::to_value(body)?), &[])
+            .await
     }
 
     /// Returns one environment.
     pub async fn get_env(&self, org_id: &str, env_id: &str) -> Result<JsonObject> {
-        self.data(
-            Method::GET,
-            &format!("/orgs/{}/envs/{}", enc(org_id), enc(env_id)),
-            None,
-            &[],
-        )
-        .await
+        let path = format!(
+            "/orgs/{}/envs/{}",
+            enc_segment(org_id)?,
+            enc_segment(env_id)?
+        );
+        self.data(Method::GET, &path, None, &[]).await
     }
 
-    /// Returns the list envelope of the organization's org API keys (the
-    /// key's own organization only).
+    /// Returns the first page of the organization's org API keys (the key's
+    /// own organization only). Use [`OrgsResource::list_api_keys_with_query`]
+    /// to page.
     pub async fn list_api_keys(&self, org_id: &str) -> Result<JsonObject> {
+        self.list_api_keys_with_query(org_id, &[]).await
+    }
+
+    /// Returns one page of the organization's org API keys (the key's own
+    /// organization only); pass `limit` (up to 500) and `offset`.
+    pub async fn list_api_keys_with_query(
+        &self,
+        org_id: &str,
+        query: &[(&str, &str)],
+    ) -> Result<JsonObject> {
+        let path = format!("/orgs/{}/api-keys", enc_segment(org_id)?);
         self.transport
-            .request_json(
-                Method::GET,
-                &format!("/orgs/{}/api-keys", enc(org_id)),
-                None,
-                &[],
-            )
+            .request_json(Method::GET, &path, None, query)
             .await
     }
 
@@ -1338,13 +1488,9 @@ impl OrgsResource {
     /// `expires_at`) within the caller's grants. The returned `token` is
     /// shown only once.
     pub async fn create_api_key(&self, org_id: &str, body: impl Serialize) -> Result<JsonObject> {
-        self.data(
-            Method::POST,
-            &format!("/orgs/{}/api-keys", enc(org_id)),
-            Some(serde_json::to_value(body)?),
-            &[],
-        )
-        .await
+        let path = format!("/orgs/{}/api-keys", enc_segment(org_id)?);
+        self.data(Method::POST, &path, Some(serde_json::to_value(body)?), &[])
+            .await
     }
 
     /// Returns the list envelope of an environment's API keys; pass `limit`
@@ -1355,13 +1501,13 @@ impl OrgsResource {
         env_id: &str,
         query: &[(&str, &str)],
     ) -> Result<JsonObject> {
+        let path = format!(
+            "/orgs/{}/envs/{}/api-keys",
+            enc_segment(org_id)?,
+            enc_segment(env_id)?
+        );
         self.transport
-            .request_json(
-                Method::GET,
-                &format!("/orgs/{}/envs/{}/api-keys", enc(org_id), enc(env_id)),
-                None,
-                query,
-            )
+            .request_json(Method::GET, &path, None, query)
             .await
     }
 
@@ -1375,21 +1521,26 @@ impl OrgsResource {
         env_id: &str,
         body: impl Serialize,
     ) -> Result<JsonObject> {
-        self.data(
-            Method::POST,
-            &format!("/orgs/{}/envs/{}/api-keys", enc(org_id), enc(env_id)),
-            Some(serde_json::to_value(body)?),
-            &[],
-        )
-        .await
+        let path = format!(
+            "/orgs/{}/envs/{}/api-keys",
+            enc_segment(org_id)?,
+            enc_segment(env_id)?
+        );
+        self.data(Method::POST, &path, Some(serde_json::to_value(body)?), &[])
+            .await
     }
 
     /// Projects, builds, and context inside one environment, authorized by
     /// the org key's grants projected onto it.
     pub fn env(&self, org_id: &str, env_id: &str) -> OrgEnv {
+        let prefix = match (enc_segment(org_id), enc_segment(env_id)) {
+            (Ok(org_id), Ok(env_id)) => Ok(format!("/orgs/{org_id}/envs/{env_id}")),
+            (Err(Error::Protocol(message)), _) | (_, Err(Error::Protocol(message))) => Err(message),
+            (Err(error), _) | (_, Err(error)) => Err(error.to_string()),
+        };
         OrgEnv {
             transport: self.transport.clone(),
-            prefix: format!("/orgs/{}/envs/{}", enc(org_id), enc(env_id)),
+            prefix,
         }
     }
 }
@@ -1397,20 +1548,25 @@ impl OrgsResource {
 /// Project, build, and context resources of one environment, reached with
 /// an org API key through `/v1/orgs/{org_id}/envs/{env_id}`. Returned by
 /// [`OrgsResource::env`].
+#[derive(Debug, Clone)]
 pub struct OrgEnv {
     transport: Arc<Transport>,
-    prefix: String,
+    prefix: std::result::Result<String, String>,
 }
 
 impl OrgEnv {
+    /// Projects inside this organization environment.
     pub fn projects(&self) -> ProjectsResource {
         ProjectsResource::scoped(self.transport.clone(), self.prefix.clone())
     }
 
+    /// Builds inside this organization environment.
     pub fn builds(&self) -> BuildsResource {
         BuildsResource::scoped(self.transport.clone(), self.prefix.clone())
     }
 
+    /// Encrypted project context variables inside this organization
+    /// environment.
     pub fn context(&self) -> ContextResource {
         ContextResource::scoped(self.transport.clone(), self.prefix.clone())
     }
@@ -1419,7 +1575,7 @@ impl OrgEnv {
 impl ApiKeysResource {
     /// Returns an org or environment API key's metadata (never its secret).
     pub async fn get(&self, key_id: &str) -> Result<JsonObject> {
-        let path = format!("/api-keys/{}", enc(key_id));
+        let path = format!("/api-keys/{}", enc_segment(key_id)?);
         let envelope = self
             .transport
             .request_json(Method::GET, &path, None, &[])
@@ -1430,7 +1586,7 @@ impl ApiKeysResource {
     /// Replaces a key's grants (`{"permissions": ...}`); they must fit inside
     /// the caller's own, and only keys the caller issued can change.
     pub async fn update(&self, key_id: &str, body: impl Serialize) -> Result<JsonObject> {
-        let path = format!("/api-keys/{}", enc(key_id));
+        let path = format!("/api-keys/{}", enc_segment(key_id)?);
         let envelope = self
             .transport
             .request_json(
@@ -1445,7 +1601,7 @@ impl ApiKeysResource {
 
     /// Revokes a key. Everything it issued stops on its next request.
     pub async fn revoke(&self, key_id: &str) -> Result<()> {
-        let path = format!("/api-keys/{}", enc(key_id));
+        let path = format!("/api-keys/{}", enc_segment(key_id)?);
         self.transport
             .request_json(Method::DELETE, &path, None, &[])
             .await?;
@@ -1456,7 +1612,7 @@ impl ApiKeysResource {
     /// previous secret keeps working for `overlap_seconds` (server default
     /// 86400, maximum 604800).
     pub async fn rotate(&self, key_id: &str, overlap_seconds: Option<u64>) -> Result<JsonObject> {
-        let path = format!("/api-keys/{}/rotate", enc(key_id));
+        let path = format!("/api-keys/{}/rotate", enc_segment(key_id)?);
         let body = match overlap_seconds {
             Some(seconds) => json!({ "overlap_seconds": seconds }),
             None => json!({}),
@@ -1469,9 +1625,102 @@ impl ApiKeysResource {
     }
 }
 
+fn error_stream(error: Error) -> EventStream {
+    Box::pin(async_stream::stream! { yield Err(error) })
+}
+
 fn project_query(project: Option<&str>) -> Vec<(String, String)> {
     match project {
         Some(project) => vec![("project".to_string(), project.to_string())],
         None => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HotClient;
+
+    #[tokio::test]
+    async fn invalid_path_segments_fail_locally_before_http() {
+        let client = HotClient::builder("test-token")
+            .base_url("http://127.0.0.1:1")
+            .build();
+
+        assert!(matches!(
+            client.sessions().revoke(".").await,
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            client.context().delete("p1", "..").await,
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            client.projects().get("").await,
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            client.files().upload("../x", b"data".to_vec(), None).await,
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            client.files().upload("/", b"data".to_vec(), None).await,
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            client.orgs().env(".", "e1").projects().list(&[]).await,
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            client.tasks().wait("..", TaskWaitOptions::default()).await,
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            client.runs().wait(".", RunWaitOptions::default()).await,
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            client
+                .streams()
+                .wait_for_run_result("..", "e1", WaitOptions::default())
+                .await,
+            Err(Error::Protocol(_))
+        ));
+
+        let mut stream = client.runs().subscribe(".");
+        assert!(matches!(stream.next().await, Some(Err(Error::Protocol(_)))));
+    }
+
+    #[test]
+    fn bounded_set_evicts_oldest_entries() {
+        let mut set = BoundedSet::new(2);
+        assert!(set.insert("r1".into()));
+        assert!(!set.insert("r1".into()));
+        assert!(set.insert("r2".into()));
+        assert!(set.insert("r3".into()));
+        // r1 was evicted when r3 pushed past capacity 2.
+        assert_eq!(set.entries.len(), 2);
+        assert!(set.insert("r1".into()));
+    }
+
+    #[test]
+    fn options_and_resources_implement_debug() {
+        let client = HotClient::builder("super_secret_token").build();
+        let resource_debug = format!("{:?}", client.events());
+        assert!(!resource_debug.contains("super_secret_token"));
+
+        let mut cb = |_: &str| {};
+        let wait_opts = WaitOptions {
+            timeout: Duration::from_secs(5),
+            on_chunk: Some(&mut cb),
+        };
+        assert!(format!("{wait_opts:?}").contains("<callback>"));
+
+        let mut cb2 = |_: &str| {};
+        let call_opts = CallOptions {
+            timeout: Duration::from_secs(5),
+            on_chunk: Some(&mut cb2),
+        };
+        assert!(format!("{call_opts:?}").contains("<callback>"));
     }
 }

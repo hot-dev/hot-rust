@@ -8,3 +8,8 @@ all-features = true
 [advisories]
 yanked = "deny"
 ignore = []
+
+[bans]
+deny = [
+    { crate = "openssl-sys", reason = "Use rustls-tls; never link OpenSSL" },
+]

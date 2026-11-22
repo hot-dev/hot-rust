@@ -108,10 +108,11 @@ The durable helpers (`runs().wait`, `tasks().wait`,
   seconds), `408`, `429`, and `5xx` reconnect with jittered exponential
   backoff (0.25–0.5 s, doubling to at most 5–10 s), waiting at least the
   server's `retry_after`.
-- `max_attempts` (default 5) caps *consecutive* failed connections. A
-  connection that delivers events resets the count, and the API's routine
-  5-minute rollover (`stream:complete`) reconnects at once, so a run of any
-  length can be awaited.
+- `max_attempts` (default 5, configurable on `RunWaitOptions`,
+  `TaskWaitOptions`, and `SubscribeWithEventOptions`) caps *consecutive*
+  failed connections. A connection that delivers events resets the count, and
+  the API's routine 5-minute rollover (`stream:complete`) reconnects at once,
+  so a run of any length can be awaited.
 - The `timeout` bounds everything, backoff included: a wait never outlives it.
 
 Run-result helpers follow handler retries: a run that fails with status
@@ -145,19 +146,22 @@ key the call needs (`KeyScope::Org` or `KeyScope::Env`): see
 ### Retries
 
 JSON requests are retried automatically (at most twice) when the API responds
-429 with a `retry_after`, and idempotent ones (`GET`, `PUT`, `DELETE`) also on
-502, 503, or 504; other errors are returned as-is. Each JSON request is bounded
-by the builder's `timeout` (default 60 seconds). Raw requests (uploads and
-downloads) are never retried; streaming helpers reconnect as described under
-[Reconnects](#reconnects).
+429 with a `retry_after`, on `POST` responses with `503 event_publish_in_progress`
+(when retrying a caller-supplied `event_id` publish), and for idempotent methods
+(`GET`, `PUT`, `DELETE`) also on 502, 503, or 504; other errors are returned
+as-is. Each JSON request and retry sleep is bounded by the builder's `timeout`
+(default 60 seconds). Raw requests (uploads and downloads) are never retried;
+streaming helpers reconnect as described under [Reconnects](#reconnects).
 
 ## Resources
 
-`HotClient` mirrors the Hot API v1 resources:
+`HotClient` mirrors the Hot API v1 resources (plus the unauthenticated health
+check):
 
-- `client.events()` — publish, list, get, inspect event runs, and call Hot functions with `call_hot(fn, args, opts)`
+- `client.status()` — public server health check (`GET /status`, sent without an `Authorization` header)
+- `client.events()` — publish (supports caller-supplied `event_id` UUIDv7 for idempotent publish, returning `409 event_id_conflict` on payload mismatch and auto-retrying `503 event_publish_in_progress`), list, get, inspect event runs (`get_runs` / `get_runs_with_query`), and call Hot functions with `call_hot(fn, args, opts)`
 - `client.streams()` — subscribe to run and task updates, wait for run results, and publish events atomically (reconnects automatically across the 5-minute SSE timeout; set `reconnect: false` to opt out)
-- `client.runs()` — list, inspect, subscribe to, and wait for durable runs
+- `client.runs()` — list (supports filters such as `status`, `run_type`, `event_id`, `project_id`, `stream_id`, `origin_run_id`, `created_after`, `created_before`, `limit`, and `offset`), inspect, subscribe to, and wait for durable runs
 - `client.tasks()` — get, subscribe to, and wait for durable background tasks
 - `client.files()` — upload, download, list, and delete files (including multipart uploads)
 - `client.blobs()` — download large payloads spilled to blob storage by `blob_ref_id` (environment API key)
@@ -174,8 +178,10 @@ downloads) are never retried; streaming helpers reconnect as described under
 List helpers return the first page of results (`data` plus `pagination` with
 `total`, `limit`, `offset`, and `has_more`). Methods that take a `query` accept
 `limit` (up to 500) and `offset`; `context().list_with_query`,
-`domains().list_with_query`, `projects().event_handlers_with_query`, and
-`projects().schedules_with_query` page the helpers that take none.
+`domains().list_with_query`, `events().get_runs_with_query`,
+`orgs().list_envs_with_query`, `orgs().list_api_keys_with_query`,
+`projects().event_handlers_with_query`, and `projects().schedules_with_query`
+page the helpers that take none.
 
 Use `client.request(...)` for JSON endpoints that do not yet have a resource
 helper, or `client.request_builder(...)` + `client.execute(...)` for full
@@ -199,25 +205,25 @@ let client = hot_dev::HotClient::builder("token").http_client(http).build();
 ```
 
 Tokens are trimmed, so one read from a file or secret store with a trailing
-newline works. A token that is still not a valid header value fails every
-request before it is sent; `HotClientBuilder::try_build` reports it when the
-client is built instead.
+newline works. An empty, whitespace-only, or invalid header token fails every
+authenticated request before it is sent; `HotClientBuilder::try_build` reports
+it when the client is built instead.
 
 Do not set a client-wide timeout on a client used for SSE subscriptions — it
 bounds the whole request, including the stream. Use the builder's `timeout`
 (JSON requests only) instead.
 
-### TLS dependency updates
+### TLS and URL dependency updates
 
-Since 1.3.0 the SDK requires `rustls` 0.23.46, `rustls-webpki` 0.103.16, and
-`webpki-roots` 1.0.10 or newer compatible versions (RUSTSEC-2026-0346 to 0349,
-0381, 0382). These minimums apply to applications using the published crate,
-independently of this repository's lockfile.
+Since 1.3.0 the SDK requires `rustls` 0.23.46, `rustls-webpki` 0.103.17,
+`webpki-roots` 1.0.12, and `url` 2.5.9 or newer compatible versions
+(RUSTSEC-2026-0346 to 0349, 0381, 0382). These minimums apply to applications
+using the published crate, independently of this repository's lockfile.
 
-When upgrading an existing application, refresh its TLS dependencies and rebuild:
+When upgrading an existing application, refresh these dependencies and rebuild:
 
 ```bash
-cargo update -p rustls -p rustls-webpki -p webpki-roots
+cargo update -p rustls -p rustls-webpki -p webpki-roots -p url
 ```
 
 ## Request Bodies
@@ -298,16 +304,18 @@ assert_eq!(error.required_scope(), Some(KeyScope::Env));
 | `orgs().get(org_id)` / `orgs().update(org_id, {"state": ...})` | `GET`/`PATCH /v1/orgs/{org_id}` (`active`, `suspended`, `archived`) |
 | `orgs().usage(parent_org_id)` | `GET /v1/orgs/{org_id}/usage` (account usage; the parent organization's ID) |
 | `orgs().purge_calls(org_id, include_sub_orgs)` | `DELETE /v1/orgs/{org_id}/calls` |
-| `orgs().list_envs(org_id)` / `create_env` / `get_env` | `/v1/orgs/{org_id}/envs` |
-| `orgs().list_api_keys(org_id)` / `create_api_key` | `/v1/orgs/{org_id}/api-keys` (org keys) |
+| `orgs().list_envs(org_id)` / `list_envs_with_query` / `create_env` / `get_env` | `/v1/orgs/{org_id}/envs` |
+| `orgs().list_api_keys(org_id)` / `list_api_keys_with_query` / `create_api_key` | `/v1/orgs/{org_id}/api-keys` (org keys) |
 | `orgs().list_env_api_keys(org_id, env_id, query)` / `create_env_api_key` | `/v1/orgs/{org_id}/envs/{env_id}/api-keys` |
-| `api_keys().get` / `update` / `revoke` / `rotate(key_id, overlap_seconds)` | `/v1/api-keys/{key_id}` |
+| `api_keys().get` / `update` / `revoke` / `rotate(key_id, overlap_seconds)` | `/v1/api-keys/{key_id}` (`status`: `active`, `disabled`, `revoked`, `expired`) |
 | `orgs().env(org_id, env_id).projects()` / `.builds()` / `.context()` | projects, builds, deploys, and context in that environment |
 
 Grants use qualified resources such as `org:*` (sub-organizations), `org:*/env:*`, and
 `org:*/env:*/project:*`; a key can only mint keys within its own grants, and
-revoking or narrowing a key restricts everything it issued. See the server's
-[org API documentation](https://hot.dev/docs/api/management).
+revoking or narrowing a key restricts everything it issued. API key records
+report `status` as `active`, `disabled`, `revoked`, or `expired` (a key in a
+suspended organization or administratively disabled key reports `disabled`). See
+the server's [org API documentation](https://hot.dev/docs/api/management).
 
 ### Sub-org integration tests
 

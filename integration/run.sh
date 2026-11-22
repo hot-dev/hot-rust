@@ -33,4 +33,4 @@ export HOT_TEST_API_KEY
 
 echo "hot dev ready; running integration tests..."
 cd ..
-cargo test --test integration -- --ignored
+cargo test --locked --test integration -- --ignored
